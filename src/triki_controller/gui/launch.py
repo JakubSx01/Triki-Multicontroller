@@ -29,12 +29,18 @@ TK_MISSING_MESSAGE = GUI_MISSING_MESSAGE
 
 
 def virtual_input_note() -> str | None:
-    """Live mouse, wheel, and keys use the Linux uinput backend."""
+    """Describe native output limitations without probing OS dependencies."""
     if sys.platform.startswith("linux"):
         return None
+    if sys.platform in {"win32", "darwin"}:
+        return (
+            "Wyjście Live używa natywnego backendu systemu. "
+            "Kierownica i wirtualny gamepad nie są obsługiwane; "
+            "kursor nie jest wirtualnym joystickiem."
+        )
     return (
-        "Wyjście na żywo używa Linux uinput. "
-        "Na tym systemie działa panel, podgląd osi i zapis ustawień."
+        f"Wyjście Live nie jest obsługiwane na {sys.platform!r}. "
+        "Użyj trybu dry-run lub systemu Linux, Windows albo macOS."
     )
 
 

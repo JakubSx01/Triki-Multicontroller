@@ -50,6 +50,20 @@ class EmulatorRuntime:
     _epoch: int = 0
     _live: bool = False
     _button_down: bool = False
+    _native_cleanup_pending: bool = False
+    _native_error: str | None = None
+
+    @property
+    def native_output(self) -> bool:
+        return getattr(self.output, "BACKEND_NAME", None) in {"windows", "macos"}
+
+    @property
+    def cleanup_pending(self) -> bool:
+        return self.native_output and self._native_cleanup_pending
+
+    def note_output_receipt(self, receipt: OutputReceipt | None) -> None:
+        if self.native_output and receipt is not None:
+            self._native_error = None if receipt.applied else (receipt.detail or "native output failed")
 
     def __post_init__(self) -> None:
         oid = parse_orientation(self.orientation)
@@ -81,10 +95,30 @@ class EmulatorRuntime:
             raw=PipelineStageStatus.AVAILABLE,
             filtered=PipelineStageStatus.AVAILABLE,
             profile_mapping=PipelineStageStatus.AVAILABLE,
-            final_output=PipelineStageStatus.AVAILABLE,
+            final_output=(PipelineStageStatus.ERROR if self.native_output and self._native_error
+                          else PipelineStageStatus.AVAILABLE),
         )
 
     def activate(self, *, live: bool = False) -> None:
+        if self.native_output:
+            if self.cleanup_pending or self._active:
+                raise RuntimeError("native output cleanup required before activation")
+            self._native_cleanup_pending = True  # open may allocate before raising
+            try:
+                self._live = live
+                self._epoch += 1
+                self.output.open(self._capabilities())
+                self._active = True
+                if self._armed:
+                    self._arm_media_baseline()
+            except Exception as exc:
+                try:
+                    self.deactivate("native activation failed", keep_origin=True)
+                except Exception as cleanup:
+                    raise RuntimeError(f"{exc}; cleanup: {cleanup}") from exc
+                raise
+            self._native_error = None
+            return
         self._live = live
         self._epoch += 1
         self.output.open(self._capabilities())
@@ -95,6 +129,17 @@ class EmulatorRuntime:
 
     def switch_profile(self, profile: Profile) -> None:
         """Neutralize the old device, then open the new profile. Does not touch BLE."""
+        if self.native_output:
+            previous = self.profile
+            candidate = profile.validated()
+            self.deactivate("profile change")
+            self.profile = candidate
+            try:
+                self.activate(live=self._live)
+            except Exception:
+                self.profile = previous
+                raise
+            return
         if self._active:
             self.output.neutralize("profile change")
             self.output.close()
@@ -116,13 +161,18 @@ class EmulatorRuntime:
         return self._active and self._live
 
     def set_output(self, output: TraceOutput | object) -> None:
+        if self.cleanup_pending:
+            raise RuntimeError("native output cleanup required before replacing backend")
         if self._active:
             raise RuntimeError("deactivate before replacing the output backend")
         self.output = output
+        self._native_error = None
 
     def set_profile(self, profile: Profile) -> None:
         """Change profile. Reopens the device only while active; never touches BLE."""
         profile = profile.validated()
+        if self.cleanup_pending and not self._active:
+            raise RuntimeError("native output cleanup required before changing profile")
         if self._active and profile.mode != self.profile.mode:
             self.switch_profile(profile)
             return
@@ -154,6 +204,44 @@ class EmulatorRuntime:
         return self.motion.calibrate(stationary_window)
 
     def deactivate(self, reason: str, *, keep_origin: bool = False) -> None:
+        if self.native_output:
+            was_active = self._active
+            self._active = False  # Never dispatch another frame while cleanup fails.
+            errors = []
+            if was_active or self.cleanup_pending:
+                self._native_cleanup_pending = True
+                pending = self.mapper.take_pending_click() if was_active else None
+                # An uncertain pulse must not be replayed: retry releases, not presses.
+                if pending is not None:
+                    try:
+                        receipt = self.output.apply(self._pulse_only(pending))
+                        if receipt is not None and not receipt.applied:
+                            errors.append(f"pending click: {receipt.detail}")
+                    except Exception as exc:
+                        errors.append(f"pending click: {exc}")
+                try:
+                    receipt = self.output.neutralize(reason)
+                    if receipt is not None and not receipt.applied:
+                        errors.append(f"neutralize: {receipt.detail}")
+                except Exception as exc:
+                    errors.append(f"neutralize: {exc}")
+                try:
+                    self.output.close()
+                except Exception as exc:
+                    errors.append(f"close: {exc}")
+                self._native_cleanup_pending = bool(errors)
+            if errors:
+                self._native_error = "; ".join(errors)
+                raise RuntimeError(self._native_error)
+            self._native_error = None
+            if not keep_origin:
+                self.mapper.reset()
+                self.motion.reset_time()
+                self._armed = False
+                self._still = 0
+                self._arm_t0_ns = None
+                self._button_down = False
+            return
         if self._active:
             pending = self.mapper.take_pending_click()
             if pending is not None:
@@ -196,7 +284,31 @@ class EmulatorRuntime:
         mapped = replace(mapped, activation_epoch=self._epoch)
         receipt = None
         if self._active:
-            receipt = self.output.apply(mapped)
+            if self.native_output:
+                try:
+                    receipt = self.output.apply(mapped)
+                except Exception as exc:
+                    try:
+                        self.deactivate("native dispatch failed", keep_origin=True)
+                    except Exception as cleanup:
+                        raise RuntimeError(f"{exc}; cleanup: {cleanup}") from exc
+                    raise
+            else:
+                receipt = self.output.apply(mapped)
+            if (self.native_output and self.profile.mode == "media"
+                    and receipt is not None and receipt.applied
+                    and "player_volume" in mapped.absolute_axes
+                    and "system_volume" not in mapped.absolute_axes):
+                try:
+                    take = getattr(self.output, "take_media_baseline", None)
+                    baseline = take() if take is not None else None
+                    if baseline is not None:
+                        self.mapper.set_media_baseline(baseline)
+                except Exception as exc:
+                    receipt = replace(receipt, applied=False,
+                                      detail=f"{receipt.detail}; media baseline: {exc}",
+                                      stage_status=PipelineStageStatus.ERROR)
+            self.note_output_receipt(receipt)
         return EmulatorStep(motion=motion, mapped=mapped, receipt=receipt)
 
     def _maybe_steering_button_recenter(

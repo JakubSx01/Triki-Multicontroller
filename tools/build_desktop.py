@@ -13,6 +13,16 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 NAME = "TrikiController"
+NATIVE_MODULES = {
+    "linux": ("evdev", "pywayland"),
+    "win32": ("pycaw", "comtypes", "psutil"),
+    "darwin": ("AppKit", "Foundation", "ScriptingBridge", "Quartz", "objc"),
+}
+
+
+def required_modules(target: str) -> list[str]:
+    return ["PyInstaller", "customtkinter", "PIL", "bleak", "pystray", "tkinter",
+            *NATIVE_MODULES[target]]
 
 
 def asset_manifest(root: Path = ROOT) -> list[tuple[Path, str]]:
@@ -38,12 +48,14 @@ def build_command(root: Path = ROOT, target: str | None = None, console: bool = 
            "--collect-all", "customtkinter", "--collect-all", "PIL",
            "--collect-submodules", "bleak", "--collect-submodules", "pystray",
            "--collect-submodules", "triki_controller", "--hidden-import", "desktop_shortcuts"]
-    if target == "linux":
-        cmd += ["--collect-all", "evdev", "--collect-all", "pywayland"]
-    elif not console:
+    for module in NATIVE_MODULES[target]:
+        cmd += ["--collect-all", module]
+    if target != "linux" and not console:
         cmd.append("--windowed")
     if target == "darwin":
         cmd += ["--osx-bundle-identifier", "com.homelabpowered.triki-controller"]
+        if not console:
+            cmd += ["--osx-entitlements-file", str(output / "build" / "macos-entitlements.plist")]
     sep = ";" if target == "win32" else ":"
     for path, destination in asset_manifest(root):
         cmd += ["--add-data", f"{path}{sep}{destination}"]
@@ -100,31 +112,57 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--command-only", action="store_true", help="Print command without building/writing")
     args = parser.parse_args(argv)
     try:
-        command = build_command(target=args.target, console=args.console)
+        command = build_command(root=ROOT, target=args.target, console=args.console)
     except ValueError as exc:
         parser.error(str(exc))
     if args.command_only:
         print(json.dumps(command, indent=2))
         return 0
-    required = ["PyInstaller", "customtkinter", "PIL", "bleak", "pystray", "tkinter"]
-    if args.target == "linux":
-        required += ["evdev", "pywayland"]
-    missing = [name for name in required if importlib.util.find_spec(name) is None]
+    missing = [name for name in required_modules(args.target)
+               if importlib.util.find_spec(name) is None]
     if missing:
         parser.error("Missing build dependencies: " + ", ".join(missing) + "; see docs/desktop-distribution.md")
     build = ROOT / "packaging" / "build"
     build.mkdir(parents=True, exist_ok=True)
+    generation_command = None
+    bundle_info = None
+    entitlements = None
+    requested_command = command.copy()
     with (build / "pyinstaller.log").open("w", encoding="utf-8") as log:
+        if args.target == "darwin" and not args.console:
+            from macos_bundle import (inject_bundle_metadata, makespec_command,
+                                      spec_build_command, write_entitlements)
+            entitlements = build / "macos-entitlements.plist"
+            write_entitlements(entitlements)
+            generation_command = makespec_command(command)
+            spec = build / f"{NAME}.spec"
+            # Never reuse a stale spec if generation fails or produces no output.
+            spec.unlink(missing_ok=True)
+            completed = subprocess.run(generation_command, cwd=ROOT, stdout=log,
+                                       stderr=subprocess.STDOUT)
+            if completed.returncode:
+                print(f"Spec generation failed; real log: {build / 'pyinstaller.log'}", file=sys.stderr)
+                return completed.returncode
+            bundle_info = inject_bundle_metadata(spec)
+            command = spec_build_command(command, spec)
         completed = subprocess.run(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
     if completed.returncode:
         print(f"Build failed; real log: {build / 'pyinstaller.log'}", file=sys.stderr)
         return completed.returncode
-    artifact = artifact_path(console=args.console)
+    artifact = artifact_path(root=ROOT, target=args.target, console=args.console)
     if not artifact.is_file():
         raise RuntimeError(f"PyInstaller did not produce {artifact}")
+    if bundle_info is not None:
+        from macos_bundle import verify_bundle_metadata
+        verify_bundle_metadata(artifact.parents[2], bundle_info)
     report = {"platform": sys.platform, "machine": platform.machine(), "python": sys.version,
               "artifact": str(artifact), "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
-              "command": command, "assets": [[str(p), dest] for p, dest in asset_manifest()],
+              "command": command, "requested_command": requested_command,
+              "spec_generation_command": generation_command, "bundle_info_plist": bundle_info,
+              "entitlements_file": str(entitlements) if entitlements else None,
+              "signing_mode": "pyinstaller-default-ad-hoc" if args.target == "darwin" else None,
+              "notarized": False,
+              "assets": [[str(p), dest] for p, dest in asset_manifest()],
               "smoke_exit_code": None}
     if args.smoke:
         with (build / "smoke.log").open("w", encoding="utf-8") as log:

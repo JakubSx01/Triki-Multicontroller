@@ -72,7 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
     emulate.add_argument(
         "--live",
         action="store_true",
-        help="Create a real /dev/uinput device. Omit for a dry-run trace.",
+        help="Use native system output (Linux uinput, Windows, macOS). Omit for a dry-run trace.",
     )
     emulate.add_argument("--invert-pitch", action="store_true")
     emulate.add_argument("--invert-roll", action="store_true")
@@ -461,14 +461,19 @@ async def _run_emulate(args: argparse.Namespace) -> int:
     profile, axis_map, settings_path = loaded
     live = bool(args.live)
     if live:
-        from triki_controller.output.uinput_backend import UInputBackend
+        from triki_controller.output.platform_backend import create_live_output
 
-        output: object = UInputBackend()
+        try:
+            output = create_live_output()
+        except Exception as exc:  # noqa: BLE001 — actionable platform/dependency error
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
         print(
-            "LIVE uinput — disconnect, Ctrl+C, or process exit releases buttons and centers axes.",
+            f"LIVE {getattr(output, 'BACKEND_NAME', sys.platform)} — "
+            "disconnect or Ctrl+C neutralizes and closes native output.",
             flush=True,
         )
-        if profile.mode == "media":
+        if profile.mode == "media" and sys.platform.startswith("linux"):
             print(
                 "Media: play/next/prev via uinput keys; volume/mute via MPRIS (playerctl) "
                 "for the active player — not system-wide Pulse volume.",
@@ -476,7 +481,7 @@ async def _run_emulate(args: argparse.Namespace) -> int:
             )
     else:
         output = TraceOutput()
-        print("DRY-RUN — no Linux input events. Pass --live to use /dev/uinput.", flush=True)
+        print("DRY-RUN — no system input events. Pass --live to use native output.", flush=True)
 
     session_id = args.session_id or str(uuid.uuid4())
     runtime = EmulatorRuntime(profile=profile, output=output, orientation=orientation)
@@ -487,7 +492,12 @@ async def _run_emulate(args: argparse.Namespace) -> int:
 
         active = resolve_axis_map(axis_map)[profile.mode]
         print(f"settings={settings_path} axis_map={json.dumps(active)}", flush=True)
-    runtime.activate(live=live)
+    try:
+        runtime.activate(live=live)
+    except Exception as exc:  # noqa: BLE001 — unsupported mode or native permission/dependency
+        output.close()
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     _print_pipeline(runtime)
     mount = get_orientation(orientation)
     print(
@@ -526,7 +536,7 @@ async def _run_emulate(args: argparse.Namespace) -> int:
         )
     else:
         print(
-            "Media is always horizontal. Twist right/left changes player volume (MPRIS) "
+            "Media is always horizontal. Twist right/left changes player volume "
             "from the level at connect — clamped 0–100%, no unwind past the ends. "
             "Gravity lean does not change volume. One click pauses, two next, three previous. "
             "Flip the cap to mute the player and steer system volume; flip back to restore music.",

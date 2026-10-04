@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import sys
 import threading
 import time
 import uuid
@@ -100,9 +101,9 @@ class SessionSnapshot:
 
 def default_output_factory(live: bool) -> object:
     if live:
-        from triki_controller.output.uinput_backend import UInputBackend
+        from triki_controller.output.platform_backend import create_live_output
 
-        return UInputBackend()
+        return create_live_output()
     return TraceOutput(history_limit=256)
 
 
@@ -213,6 +214,11 @@ class ControllerSession:
                 profile = self._build_profile(name)
             except ValueError as exc:
                 return f"Nieprawidłowy profil: {exc}"
+            if self._runtime.native_output:
+                # Clean the old mapper/backend before changing mount or UI metadata.
+                error = self._apply_profile_locked(profile)
+                if error is not None:
+                    return error
             self._profile_name = name
             self._pulses.clear()
             self._pointer.clear()
@@ -411,8 +417,11 @@ class ControllerSession:
             return
         try:
             asyncio.run_coroutine_threadsafe(_drain_tasks(), loop).result(4.0)
-        except Exception:  # noqa: BLE001 — closing anyway; inputs are already neutral
-            pass
+        except Exception as exc:  # noqa: BLE001 — still stop the worker
+            if self._runtime.native_output:
+                with self._lock:
+                    note = f"Worker drainage failed: {exc!r}"
+                    self._error = f"{self._error}; {note}" if self._error else note
         loop.call_soon_threadsafe(loop.stop)
         if self._thread is not None:
             self._thread.join(timeout=3.0)
@@ -531,9 +540,18 @@ class ControllerSession:
         self._reason = event.reason
         if event.state == ConnectionState.STREAMING:
             self._reset_stream()
-        self._runtime.handle_connection(event)
+        if self._runtime.native_output:
+            try:
+                self._runtime.handle_connection(event)
+            except Exception as exc:
+                self._output_mode = OutputMode.OFF
+                note = f"Wyjście Off; cleanup pending: {exc}"
+                self._error = (self._error if note in self._error else f"{self._error}; {note}") if self._error else note
+                self._output_note = note
+        else:
+            self._runtime.handle_connection(event)
         if event.state in _ENDED:
-            if was_active:
+            if was_active and not self._runtime.cleanup_pending:
                 self._output_note = f"Wyjście zatrzymane i zneutralizowane: {event.reason}"
             self._output_mode = OutputMode.OFF
             if self._calib_window is not None:
@@ -541,6 +559,16 @@ class ControllerSession:
 
     def _note_mpris_errors(self, receipt: OutputReceipt | None) -> None:
         """Surface player-volume failures in the GUI without raising."""
+        if self._runtime.native_output and receipt is not None:
+            self._runtime.note_output_receipt(receipt)
+            if not receipt.applied:
+                self._output_note = receipt.detail or "Native output failed"
+                self._error = self._output_note  # outranks connection_reason in the existing UI
+            elif self._error == self._output_note:
+                self._error = None
+                if self._profile_name == "media":
+                    self._output_note = self._media_live_status_note()
+            return
         if receipt is None or not receipt.detail:
             return
         detail = receipt.detail
@@ -558,6 +586,34 @@ class ControllerSession:
 
     def _media_live_status_note(self) -> str:
         """Clear Live status: which MPRIS player, volume capability, uinput fallback."""
+        if self._runtime.native_output:
+            player = getattr(self._runtime.output, "_mpris", None)
+            try:
+                if player is not None and hasattr(player, "describe_status"):
+                    status = player.describe_status()
+                    detail = getattr(status, "detail", "") or ""
+                    if (getattr(status, "volume_writable", None) is False
+                            or getattr(status, "volume", None) is None
+                            or not getattr(status, "active_player", None)):
+                        self._error = detail or "Native player volume unavailable"
+                        self._runtime._native_error = self._error
+                        return self._error
+                    return f"Wyjście Live — {detail}"
+                reading = player.read_volume() if player is not None else None
+                if reading is None:
+                    self._error = str(getattr(player, "last_error", None) or "Native player volume unavailable: no readable player")
+                    self._runtime._native_error = self._error
+                    return self._error
+                return f"Wyjście Live — głośność odtwarzacza {reading:.0%}."
+            except Exception as exc:
+                self._error = f"Native player volume unavailable: {exc}"
+                self._runtime._native_error = self._error
+                return self._error
+        if not sys.platform.startswith("linux"):
+            return (
+                "Wyjście Live aktywne — natywne sterowanie multimediami. "
+                "Dostępność głośności odtwarzacza zależy od aplikacji i systemu."
+            )
         mpris = getattr(self._runtime.output, "_mpris", None) or getattr(
             self._runtime.output, "mpris", None
         )
@@ -596,18 +652,31 @@ class ControllerSession:
     def _start_output_locked(self, *, live: bool) -> str | None:
         if self._state != ConnectionState.STREAMING:
             return "Najpierw połącz się z Triki."
+        if self._runtime.native_output and (self._runtime.active or self._runtime.cleanup_pending):
+            self._stop_output_locked("zmiana trybu wyjścia")
+            if self._runtime.cleanup_pending:
+                return self._output_note
         if self._runtime.active:
             self._runtime.deactivate("zmiana trybu wyjścia", keep_origin=True)
         try:
             self._runtime.set_output(self._output_factory(live))
             self._runtime.activate(live=live)
         except Exception as exc:  # noqa: BLE001 — uinput permission, missing evdev
+            if self._runtime.native_output:
+                self._output_mode = OutputMode.OFF
+                self._output_note = f"Nie udało się uruchomić wyjścia: {exc}"
+                self._error = self._output_note
+                if not self._runtime.cleanup_pending:
+                    self._runtime.set_output(TraceOutput(history_limit=256))
+                return self._output_note
             self._runtime.deactivate("błąd uruchomienia wyjścia", keep_origin=True)
             self._runtime.set_output(TraceOutput(history_limit=256))
             self._output_mode = OutputMode.OFF
             self._output_note = f"Nie udało się uruchomić wyjścia: {exc}"
             return self._output_note
         self._output_mode = OutputMode.LIVE if live else OutputMode.DRY_RUN
+        if self._runtime.native_output:
+            self._error = None
         if self._profile_name == "media" and live:
             self._output_note = self._media_live_status_note()
         elif live:
@@ -620,6 +689,17 @@ class ControllerSession:
         return None
 
     def _stop_output_locked(self, reason: str) -> None:
+        if self._runtime.native_output:
+            self._output_mode = OutputMode.OFF
+            try:
+                self._runtime.deactivate(reason, keep_origin=True)
+            except Exception as exc:
+                note = f"Wyjście Off; cleanup pending: {exc}"
+                self._error = (self._error if note in self._error else f"{self._error}; {note}") if self._error else note
+                self._output_note = note
+            else:
+                self._output_note = f"Wyjście zatrzymane: {reason}"
+            return
         if self._runtime.active:
             self._runtime.deactivate(reason, keep_origin=True)
             self._output_note = f"Wyjście zatrzymane: {reason}"
@@ -629,6 +709,12 @@ class ControllerSession:
         try:
             self._runtime.set_profile(profile)
         except Exception as exc:  # noqa: BLE001 — reopening uinput can fail
+            if self._runtime.native_output:
+                self._output_mode = OutputMode.OFF
+                note = f"Wyjście Off po błędzie zmiany profilu: {exc}"
+                self._error = (self._error if note in self._error else f"{self._error}; {note}") if self._error else note
+                self._output_note = note
+                return self._output_note
             self._runtime.deactivate("błąd zmiany profilu", keep_origin=True)
             self._output_mode = OutputMode.OFF
             self._output_note = f"Wyjście zatrzymane po błędzie zmiany profilu: {exc}"
