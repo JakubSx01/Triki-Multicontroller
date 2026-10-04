@@ -16,7 +16,8 @@ _METADATA = frozenset({"knob", "wheel_deg", "pitch_deg", "roll_deg", "lean_x", "
                        "yaw_rate_dps", "pitch_rate_dps"})
 _VOLUME = frozenset({"volume_up", "volume_down", "mute", "cycle_player"})
 _TRANSPORT = frozenset({"play_pause", "next_track", "previous_track"})
-_MOUSE = frozenset({"mouse_left", "mouse_right"})
+from triki_controller.output.binding_input import INPUT_ACTIONS, binding_only, has_bindings, dispatch
+_MOUSE = INPUT_ACTIONS
 
 
 class MacOSOutputBackend:
@@ -35,11 +36,21 @@ class MacOSOutputBackend:
         self._fx = self._fy = 0.0
         self._dry_run = False
         self._dirty = False
+        self._input_opened = False
 
     @property
     def _mpris(self):
         # Compatibility seam used by EmulatorRuntime to capture the player baseline.
         return self.player
+
+    def read_player_volume(self):
+        return self.player.read_volume()
+
+    def list_media_players(self) -> list[tuple[str, str]]:
+        return self.player.list_media_players()
+
+    def select_media_player(self, player_id: str | None) -> None:
+        self.player.select_media_player(player_id)
 
     def take_media_baseline(self):
         return self.player.take_media_baseline()
@@ -52,11 +63,16 @@ class MacOSOutputBackend:
     def open(self, capabilities):
         if self.opened and not self.closed:
             raise RuntimeError("MacOSOutputBackend is already open")
+        if self._held or self._input_opened:
+            self.close()  # Release unresolved ownership before any reactivation.
         mode = str(capabilities.get("mode") or "")
-        if mode in {"plane", "steering"}:
+        self._binding_only = mode in {'steering', 'plane'} and binding_only(capabilities)
+        self._ignore_legacy_trigger = (self._binding_only and
+            capabilities['control_bindings'].get('button', 'default') == 'default')
+        if mode in {"plane", "steering"} and not self._binding_only:
             raise RuntimeError(f"macOS {mode}: virtual joystick/steering unsupported; "
                                "no supported virtual HID driver is included")
-        if mode not in {"mouse", "media"}:
+        if mode not in {"mouse", "media", "steering", "plane"}:
             raise RuntimeError(f"unsupported macOS mode {mode!r}")
         dry_run = bool(capabilities.get("dry_run", False))
         # Legacy claim name is kept compatible with the existing session contract;
@@ -64,13 +80,25 @@ class MacOSOutputBackend:
         if not dry_run and not (capabilities.get("claim_native") or
                                 capabilities.get("claim_uinput")):
             raise RuntimeError("macOS live output requires claim_native or claim_uinput")
-        if mode == "mouse" and not dry_run:
-            self._input.open()
+        if (mode == "mouse" or self._binding_only or has_bindings(capabilities)) and not dry_run:
+            self._input_opened = True
+            try:
+                self._input.open()
+            except Exception as exc:
+                self.opened, self.closed = False, True
+                try:
+                    self._input.close()
+                    self._input_opened = False
+                except Exception as cleanup:
+                    raise RuntimeError(f'{exc}; failed-open cleanup: {cleanup}') from exc
+                raise
         self._mode = mode
         self._epoch = int(capabilities.get("activation_epoch", 1))
         self._dry_run = dry_run
         self._held.clear()
         self._fx = self._fy = 0.0
+        if 'media_player' in capabilities:
+            self.select_media_player(capabilities['media_player'])
         self.player.leave()
         self.system.leave()
         self.opened, self.closed = True, False
@@ -87,11 +115,16 @@ class MacOSOutputBackend:
             return self._receipt(state, True, "dry-run: no native output emitted")
         errors = []
         self._dirty = True
-        desired = set(state.held_buttons) | set(state.held_keys)
-        if self._mode == "mouse":
+        # Default analog trigger is inactive without a native virtual HID.
+        # Preserve configured mouse/keyboard actions and unknown-name errors.
+        buttons = set(state.held_buttons)
+        if self._ignore_legacy_trigger:
+            buttons.discard('trigger')
+        desired = buttons | set(state.held_keys)
+        if self._held or desired or self._mode == "mouse":
             for name in sorted(self._held - desired):
                 try:
-                    self._input.button(name, False)
+                    dispatch(self._input, name, False)
                     self._held.remove(name)
                 except Exception as exc:  # Includes Objective-C bridge errors; never BaseException.
                     errors.append(f"release {name}: {exc}")
@@ -100,13 +133,13 @@ class MacOSOutputBackend:
                     errors.append(f"unsupported held input {name}")
                     continue
                 try:
-                    self._input.button(name, True)
+                    dispatch(self._input, name, True)
                     self._held.add(name)
                 except Exception as exc:  # Includes Objective-C bridge errors; never BaseException.
                     errors.append(f"press {name}: {exc}")
             try:
-                x = float(state.relative_deltas.get("pointer_x", 0))
-                y = float(state.relative_deltas.get("pointer_y", 0))
+                x = float(state.relative_deltas.get("pointer_x", 0)) if self._mode == "mouse" else 0.0
+                y = float(state.relative_deltas.get("pointer_y", 0)) if self._mode == "mouse" else 0.0
                 if not math.isfinite(x) or not math.isfinite(y):
                     raise ValueError("pointer delta must be finite")
                 self._fx += x
@@ -118,10 +151,8 @@ class MacOSOutputBackend:
                 self._fy -= iy
             except Exception as exc:  # Includes Objective-C bridge errors; never BaseException.
                 errors.append(f"mouse: {exc}")
-        elif desired:
-            errors.append("media held inputs unsupported; use mapped pulses")
         for name in state.relative_deltas:
-            if self._mode != "mouse" or name not in {"pointer_x", "pointer_y"}:
+            if not self._binding_only and (self._mode != "mouse" or name not in {"pointer_x", "pointer_y"}):
                 errors.append(f"unsupported relative delta {name}")
         # Pulses precede level writes: mute must not be overwritten by this frame's axis.
         for pulse in state.pulses:
@@ -133,12 +164,14 @@ class MacOSOutputBackend:
                 err = self.player.apply_transport(pulse)
                 if err:
                     errors.append(err)
-            elif self._mode == "mouse" and pulse in _MOUSE:
+            elif pulse in _MOUSE:
                 try:
+                    if pulse in self._held:
+                        raise RuntimeError(f'cannot pulse held input {pulse}')
                     if pulse not in self._held:
-                        self._input.button(pulse, True)
+                        dispatch(self._input, pulse, True)
                         self._held.add(pulse)
-                        self._input.button(pulse, False)
+                        dispatch(self._input, pulse, False)
                         self._held.remove(pulse)
                 except Exception as exc:  # Includes Objective-C bridge errors; never BaseException.
                     errors.append(f"pulse {pulse}: {exc}")
@@ -158,7 +191,7 @@ class MacOSOutputBackend:
                 err = self.player.apply_level(value)
                 if err:
                     errors.append(err)
-            elif name not in _METADATA:
+            elif name not in _METADATA and not self._binding_only:
                 errors.append(f"unsupported absolute axis {name}")
         if not inverted:
             self.system.leave()
@@ -172,7 +205,7 @@ class MacOSOutputBackend:
         if not self._dry_run:
             for name in sorted(self._held):
                 try:
-                    self._input.button(name, False)
+                    dispatch(self._input, name, False)
                     self._held.remove(name)
                 except Exception as exc:  # Includes Objective-C bridge errors; never BaseException.
                     errors.append(f"release {name}: {exc}")
@@ -189,16 +222,16 @@ class MacOSOutputBackend:
         )
 
     def close(self):
-        if self.opened and not self.closed:
-            if self._dirty:
-                receipt = self.neutralize("close")
-                if not receipt.applied:
-                    raise RuntimeError(receipt.detail)
-            if self._mode == "mouse" and not self._dry_run:
-                self._input.close()
-            self.system.leave()
-            self.player.leave()
         self.closed, self.opened = True, False
+        if self._dirty or self._held:
+            receipt = self.neutralize("close")
+            if not receipt.applied:
+                raise RuntimeError(receipt.detail)
+        if self._input_opened:
+            self._input.close()
+            self._input_opened = False
+        self.system.leave()
+        self.player.leave()
 
     def _receipt(self, state, applied, detail, *, status=None):
         return OutputReceipt(

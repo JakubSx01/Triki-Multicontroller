@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field, replace
+from typing import Mapping
 
 from triki_controller.core.models import (
     SCHEMA_VERSION,
@@ -22,6 +23,7 @@ from triki_controller.motion.tilt import CalibrationResult, TiltMotionProcessor
 from triki_controller.output.trace import TraceOutput
 from triki_controller.profiles.builtin import Profile
 from triki_controller.profiles.devices import DeviceProfileMapper
+from triki_controller.profiles.control_bindings import parse_control_bindings
 
 _STILL_GYRO_DPS = 12.0
 _ARM_STILL_SAMPLES = 8
@@ -52,17 +54,79 @@ class EmulatorRuntime:
     _button_down: bool = False
     _native_cleanup_pending: bool = False
     _native_error: str | None = None
+    media_player: str | None = None
+    control_bindings: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    media_gestures_enabled: bool = True
+
+    def set_control_bindings(self, mapping: Mapping[str, Mapping[str, str]]) -> None:
+        candidate = parse_control_bindings(mapping)
+        if candidate == self.control_bindings:
+            return
+        # The mapper resets transient state even for another profile's overlay.
+        reopen = self._active
+        if reopen:
+            self.deactivate("control bindings change")
+        previous = self.control_bindings
+        self.mapper.set_control_bindings(candidate)
+        self.control_bindings = candidate
+        if reopen:
+            try:
+                self.activate(live=self._live)
+            except Exception:
+                # Restore configuration only: failed cleanup may still own input.
+                # Reopening the previous mapping must be an explicit user action.
+                self.mapper.set_control_bindings(previous)
+                self.control_bindings = previous
+                raise
+
+    def set_media_gestures_enabled(self, enabled: bool) -> None:
+        if not isinstance(enabled, bool):
+            raise ValueError("media_gestures_enabled must be true or false")
+        if enabled == self.media_gestures_enabled:
+            return
+        self.mapper.set_media_gestures_enabled(enabled)
+        self.media_gestures_enabled = enabled
+
+    def list_media_players(self) -> list[tuple[str, str]]:
+        """Enumerate without changing player selection or mapper state."""
+        enumerate_players = getattr(self.output, "list_media_players", None)
+        return list(enumerate_players()) if enumerate_players is not None else []
+
+    def select_media_player(self, player: str | None) -> None:
+        """Pin the next activation, or explicitly re-seed the current live target."""
+        if player == self.media_player:
+            return
+        if self._active and self._live:
+            select = getattr(self.output, "select_media_player", None)
+            if select is None:
+                raise RuntimeError("Wyjście nie obsługuje wyboru odtwarzacza.")
+            select(player)
+            self.media_player = player
+            # Native backends seed their next safe frame through this handshake.
+            take = getattr(self.output, "take_media_baseline", None)
+            baseline = take() if take is not None else None
+            if baseline is not None:
+                self.mapper.set_media_baseline(baseline)
+            elif not self.native_output:
+                self._arm_media_baseline()
+        else:
+            self.media_player = player
 
     @property
     def native_output(self) -> bool:
         return getattr(self.output, "BACKEND_NAME", None) in {"windows", "macos"}
 
     @property
+    def managed_output(self) -> bool:
+        """Live OS backends own resources until cleanup succeeds."""
+        return self.native_output or getattr(self.output, "BACKEND_NAME", None) == "uinput"
+
+    @property
     def cleanup_pending(self) -> bool:
-        return self.native_output and self._native_cleanup_pending
+        return self.managed_output and self._native_cleanup_pending
 
     def note_output_receipt(self, receipt: OutputReceipt | None) -> None:
-        if self.native_output and receipt is not None:
+        if self.managed_output and receipt is not None:
             self._native_error = None if receipt.applied else (receipt.detail or "native output failed")
 
     def __post_init__(self) -> None:
@@ -70,6 +134,9 @@ class EmulatorRuntime:
         self.orientation = oid
         if self.motion.orientation.id != oid:
             self.motion.set_orientation(oid)
+        self.control_bindings = parse_control_bindings(self.control_bindings)
+        self.mapper.set_control_bindings(self.control_bindings)
+        self.mapper.set_media_gestures_enabled(self.media_gestures_enabled)
 
     def set_orientation(self, orientation: str) -> None:
         """Remap IMU axes for mounting. Does not touch BLE. Re-arms control origin."""
@@ -95,12 +162,12 @@ class EmulatorRuntime:
             raw=PipelineStageStatus.AVAILABLE,
             filtered=PipelineStageStatus.AVAILABLE,
             profile_mapping=PipelineStageStatus.AVAILABLE,
-            final_output=(PipelineStageStatus.ERROR if self.native_output and self._native_error
+            final_output=(PipelineStageStatus.ERROR if self.managed_output and self._native_error
                           else PipelineStageStatus.AVAILABLE),
         )
 
     def activate(self, *, live: bool = False) -> None:
-        if self.native_output:
+        if self.managed_output:
             if self.cleanup_pending or self._active:
                 raise RuntimeError("native output cleanup required before activation")
             self._native_cleanup_pending = True  # open may allocate before raising
@@ -129,7 +196,7 @@ class EmulatorRuntime:
 
     def switch_profile(self, profile: Profile) -> None:
         """Neutralize the old device, then open the new profile. Does not touch BLE."""
-        if self.native_output:
+        if self.managed_output:
             previous = self.profile
             candidate = profile.validated()
             self.deactivate("profile change")
@@ -204,7 +271,7 @@ class EmulatorRuntime:
         return self.motion.calibrate(stationary_window)
 
     def deactivate(self, reason: str, *, keep_origin: bool = False) -> None:
-        if self.native_output:
+        if self.managed_output:
             was_active = self._active
             self._active = False  # Never dispatch another frame while cleanup fails.
             errors = []
@@ -284,7 +351,7 @@ class EmulatorRuntime:
         mapped = replace(mapped, activation_epoch=self._epoch)
         receipt = None
         if self._active:
-            if self.native_output:
+            if self.managed_output:
                 try:
                     receipt = self.output.apply(mapped)
                 except Exception as exc:
@@ -295,7 +362,8 @@ class EmulatorRuntime:
                     raise
             else:
                 receipt = self.output.apply(mapped)
-            if (self.native_output and self.profile.mode == "media"
+            if (callable(getattr(self.output, "take_media_baseline", None))
+                    and self.profile.mode == "media"
                     and receipt is not None and receipt.applied
                     and "player_volume" in mapped.absolute_axes
                     and "system_volume" not in mapped.absolute_axes):
@@ -318,7 +386,8 @@ class EmulatorRuntime:
         pressed = bool(motion.button)
         rising = pressed and not self._button_down
         self._button_down = pressed
-        if not rising or self.profile.mode != "steering":
+        if (not rising or self.profile.mode != "steering"
+                or self.control_bindings.get("steering", {}).get("button", "default") != "default"):
             return motion, False
         self.motion.recenter()
         return (
@@ -395,6 +464,11 @@ class EmulatorRuntime:
             "activation_epoch": self._epoch,
             "device_name": names[self.profile.mode],
             "dry_run": not self._live,
+            "media_player": self.media_player,
+            "control_bindings": dict(self.control_bindings.get(self.profile.mode, {})),
+            "binding_only": (self.native_output and self.profile.mode in {"steering", "plane"}
+                             and any(action not in {"default", "off"}
+                                     for action in self.control_bindings.get(self.profile.mode, {}).values())),
         }
 
 

@@ -43,6 +43,7 @@ from triki_controller.profiles.devices import (
 from triki_controller.output.trace import TraceOutput
 from triki_controller.profiles.builtin import Profile, profile_by_name, with_overrides
 from triki_controller.runtime.emulator import EmulatorRuntime
+from triki_controller.profiles.control_bindings import parse_control_bindings
 
 CALIBRATION_DURATION_S = 1.5
 _CALIBRATION_GRACE_S = 3.0
@@ -130,6 +131,7 @@ class ControllerSession:
         settings = settings or GuiSettings()
         self._lock = threading.RLock()
         self._output_factory = output_factory
+        self._media_catalog: object | None = None
         self._scan_timeout = ble_scan_timeout_s
         self._profile_name = settings.profile
         self._orientation = parse_orientation(settings.orientation)
@@ -147,6 +149,9 @@ class ControllerSession:
             profile=self._build_profile(),
             output=output_factory(False),
             orientation=self._orientation,
+            control_bindings=settings.control_bindings,
+            media_gestures_enabled=settings.media_gestures_enabled,
+            media_player=settings.media_player,
         )
         self._runtime.mapper.set_axis_map(self._axis_map)
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -214,7 +219,7 @@ class ControllerSession:
                 profile = self._build_profile(name)
             except ValueError as exc:
                 return f"Nieprawidłowy profil: {exc}"
-            if self._runtime.native_output:
+            if self._runtime.managed_output:
                 # Clean the old mapper/backend before changing mount or UI metadata.
                 error = self._apply_profile_locked(profile)
                 if error is not None:
@@ -346,12 +351,38 @@ class ControllerSession:
                 invert_roll=self._invert_roll,
                 thresholds={name: dict(v) for name, v in self._overrides.items() if v},
                 axis_map={name: dict(values) for name, values in self._axis_map.items()},
+                control_bindings={name: dict(values) for name, values in self._runtime.control_bindings.items()},
+                media_gestures_enabled=self._runtime.media_gestures_enabled,
+                media_player=self._runtime.media_player,
             )
+
+    def list_media_players(self) -> list[tuple[str, str]]:
+        with self._lock:
+            if hasattr(self._runtime.output, "list_media_players"):
+                return self._runtime.list_media_players()
+            # Construct an observational adapter, never open/activate its input.
+            if self._media_catalog is None:
+                self._media_catalog = self._output_factory(True)
+            enumerate_players = getattr(self._media_catalog, "list_media_players", None)
+            return list(enumerate_players()) if enumerate_players is not None else []
+
+    def select_media_player(self, player: str | None) -> str | None:
+        with self._lock:
+            try:
+                self._runtime.select_media_player(player)
+            except Exception as exc:
+                return f"Nie udało się wybrać odtwarzacza: {exc}"
+            return None
 
     def apply_settings(self, settings: GuiSettings) -> str | None:
         with self._lock:
             overrides = {name: dict(settings.thresholds.get(name, {})) for name in PROFILE_NAMES}
             try:
+                bindings = parse_control_bindings(settings.control_bindings)
+                if not isinstance(settings.media_gestures_enabled, bool):
+                    raise ValueError("media_gestures_enabled must be true or false")
+                if settings.media_player is not None and not isinstance(settings.media_player, str):
+                    raise ValueError("media_player must be a string or null")
                 orientation = parse_orientation(settings.orientation)
                 profile = with_overrides(
                     profile_by_name(
@@ -363,21 +394,66 @@ class ControllerSession:
                 )
             except ValueError as exc:
                 return f"Nieprawidłowe ustawienia: {exc}"
-            self._overrides = overrides
-            self._axis_map = {name: dict(values) for name, values in settings.axis_map.items()}
-            self._runtime.mapper.set_axis_map(self._axis_map)
-            self._invert_pitch = settings.invert_pitch
-            self._invert_roll = settings.invert_roll
-            self._profile_name = settings.profile
-            if settings.profile == "media":
-                orientation = MEDIA_ORIENTATION
-            elif settings.profile == "steering":
-                orientation = STEERING_ORIENTATION
-            elif settings.profile == "mouse":
-                orientation = MOUSE_ORIENTATION
-            self._orientation = orientation
-            self._runtime.set_orientation(orientation)
-            return self._apply_profile_locked(profile)
+            previous = self.current_settings()
+            previous_profile = self._runtime.profile
+            was_active, was_live = self._runtime.active, self._runtime.live
+            reopen = was_active and (settings.profile != self._profile_name
+                                     or bindings != self._runtime.control_bindings)
+            try:
+                if reopen:
+                    # Stage the whole candidate offline, then open exactly once.
+                    self._runtime.deactivate("settings change")
+                self._runtime.set_control_bindings(bindings)
+                self._runtime.set_media_gestures_enabled(settings.media_gestures_enabled)
+                self._runtime.select_media_player(settings.media_player)
+                self._overrides = overrides
+                self._axis_map = {name: dict(values) for name, values in settings.axis_map.items()}
+                self._runtime.mapper.set_axis_map(self._axis_map)
+                self._invert_pitch = settings.invert_pitch
+                self._invert_roll = settings.invert_roll
+                self._profile_name = settings.profile
+                if settings.profile == "media":
+                    orientation = MEDIA_ORIENTATION
+                elif settings.profile == "steering":
+                    orientation = STEERING_ORIENTATION
+                elif settings.profile in {"mouse", "plane"}:
+                    orientation = MOUSE_ORIENTATION
+                self._orientation = orientation
+                self._runtime.set_orientation(orientation)
+                self._runtime.set_profile(profile)
+                if reopen:
+                    self._runtime.activate(live=was_live)
+            except Exception as exc:
+                errors = [str(exc)]
+                # Roll back configuration, not activation or resource ownership.
+                if self._runtime.active:
+                    try:
+                        self._runtime.deactivate("settings rejected")
+                    except Exception as cleanup:
+                        errors.append(f"cleanup: {cleanup}")
+                if (settings.media_player != previous.media_player
+                        and not self._runtime.cleanup_pending):
+                    select = getattr(self._runtime.output, "select_media_player", None)
+                    if select is not None:
+                        try:
+                            select(previous.media_player)
+                        except Exception as rollback:
+                            errors.append(f"selection rollback: {rollback}")
+                self._runtime.control_bindings = previous.control_bindings
+                self._runtime.mapper.set_control_bindings(previous.control_bindings)
+                self._runtime.set_media_gestures_enabled(previous.media_gestures_enabled)
+                self._runtime.media_player = previous.media_player
+                self._runtime.profile = previous_profile
+                self._axis_map = previous.axis_map
+                self._runtime.mapper.set_axis_map(self._axis_map)
+                self._overrides = {name: dict(previous.thresholds.get(name, {})) for name in PROFILE_NAMES}
+                self._invert_pitch, self._invert_roll = previous.invert_pitch, previous.invert_roll
+                self._profile_name, self._orientation = previous.profile, previous.orientation
+                self._runtime.set_orientation(previous.orientation)
+                self._output_mode = OutputMode.OFF
+                self._error = self._output_note = "Nie udało się zastosować sterowania: " + "; ".join(errors)
+                return self._output_note
+            return None
 
     def snapshot(self) -> SessionSnapshot:
         with self._lock:
@@ -412,13 +488,23 @@ class ControllerSession:
 
     def shutdown(self) -> None:
         self.disconnect("zamknięcie programu")
+        if self._media_catalog is not None:
+            close = getattr(self._media_catalog, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception as exc:
+                    # Catalog input was never opened; still drain the transport worker.
+                    note = f"Nie udało się zamknąć listy odtwarzaczy: {exc}"
+                    self._error = f"{self._error}; {note}" if self._error else note
+            self._media_catalog = None
         loop = self._loop
         if loop is None:
             return
         try:
             asyncio.run_coroutine_threadsafe(_drain_tasks(), loop).result(4.0)
         except Exception as exc:  # noqa: BLE001 — still stop the worker
-            if self._runtime.native_output:
+            if self._runtime.managed_output:
                 with self._lock:
                     note = f"Worker drainage failed: {exc!r}"
                     self._error = f"{self._error}; {note}" if self._error else note
@@ -540,7 +626,7 @@ class ControllerSession:
         self._reason = event.reason
         if event.state == ConnectionState.STREAMING:
             self._reset_stream()
-        if self._runtime.native_output:
+        if self._runtime.managed_output:
             try:
                 self._runtime.handle_connection(event)
             except Exception as exc:
@@ -559,7 +645,7 @@ class ControllerSession:
 
     def _note_mpris_errors(self, receipt: OutputReceipt | None) -> None:
         """Surface player-volume failures in the GUI without raising."""
-        if self._runtime.native_output and receipt is not None:
+        if self._runtime.managed_output and receipt is not None:
             self._runtime.note_output_receipt(receipt)
             if not receipt.applied:
                 self._output_note = receipt.detail or "Native output failed"
@@ -568,7 +654,9 @@ class ControllerSession:
                 self._error = None
                 if self._profile_name == "media":
                     self._output_note = self._media_live_status_note()
-            return
+            if self._runtime.native_output or not receipt.applied:
+                return
+            # Linux volume failures remain soft receipts; preserve their notes.
         if receipt is None or not receipt.detail:
             return
         detail = receipt.detail
@@ -652,7 +740,7 @@ class ControllerSession:
     def _start_output_locked(self, *, live: bool) -> str | None:
         if self._state != ConnectionState.STREAMING:
             return "Najpierw połącz się z Triki."
-        if self._runtime.native_output and (self._runtime.active or self._runtime.cleanup_pending):
+        if self._runtime.managed_output and (self._runtime.active or self._runtime.cleanup_pending):
             self._stop_output_locked("zmiana trybu wyjścia")
             if self._runtime.cleanup_pending:
                 return self._output_note
@@ -662,7 +750,7 @@ class ControllerSession:
             self._runtime.set_output(self._output_factory(live))
             self._runtime.activate(live=live)
         except Exception as exc:  # noqa: BLE001 — uinput permission, missing evdev
-            if self._runtime.native_output:
+            if self._runtime.managed_output:
                 self._output_mode = OutputMode.OFF
                 self._output_note = f"Nie udało się uruchomić wyjścia: {exc}"
                 self._error = self._output_note
@@ -675,7 +763,7 @@ class ControllerSession:
             self._output_note = f"Nie udało się uruchomić wyjścia: {exc}"
             return self._output_note
         self._output_mode = OutputMode.LIVE if live else OutputMode.DRY_RUN
-        if self._runtime.native_output:
+        if self._runtime.managed_output:
             self._error = None
         if self._profile_name == "media" and live:
             self._output_note = self._media_live_status_note()
@@ -689,7 +777,7 @@ class ControllerSession:
         return None
 
     def _stop_output_locked(self, reason: str) -> None:
-        if self._runtime.native_output:
+        if self._runtime.managed_output:
             self._output_mode = OutputMode.OFF
             try:
                 self._runtime.deactivate(reason, keep_origin=True)
@@ -709,7 +797,7 @@ class ControllerSession:
         try:
             self._runtime.set_profile(profile)
         except Exception as exc:  # noqa: BLE001 — reopening uinput can fail
-            if self._runtime.native_output:
+            if self._runtime.managed_output:
                 self._output_mode = OutputMode.OFF
                 note = f"Wyjście Off po błędzie zmiany profilu: {exc}"
                 self._error = (self._error if note in self._error else f"{self._error}; {note}") if self._error else note

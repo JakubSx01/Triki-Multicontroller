@@ -18,6 +18,7 @@ from triki_controller.motion.orientation import (
     parse_orientation,
 )
 from triki_controller.profiles.axis_map import parse_axis_map
+from triki_controller.profiles.control_bindings import parse_control_bindings
 from triki_controller.profiles.builtin import PROFILE_LIMITS, profile_by_name, with_overrides
 
 SETTINGS_SCHEMA_VERSION = 1
@@ -50,6 +51,9 @@ _TOP_LEVEL = {
     "invert_roll",
     "thresholds",
     "axis_map",
+    "media_gestures_enabled",
+    "media_player",
+    "control_bindings",
 }
 
 
@@ -68,8 +72,15 @@ class GuiSettings:
     thresholds: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
     axis_map: Mapping[str, Mapping[str, str | float]] = field(default_factory=dict)
 
+    media_gestures_enabled: bool = True
+    media_player: str | None = None
+    control_bindings: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+
     def to_json(self) -> dict[str, object]:
         return {
+            "media_gestures_enabled": self.media_gestures_enabled,
+            "media_player": self.media_player,
+            "control_bindings": parse_control_bindings(self.control_bindings),
             "schema_version": SETTINGS_SCHEMA_VERSION,
             "profile": self.profile,
             "orientation": self.orientation,
@@ -128,6 +139,13 @@ def parse_settings(data: object) -> GuiSettings:
         flags[key] = bool(value)
     thresholds = _parse_thresholds(data.get("thresholds", {}), errors)
     axis_map = parse_axis_map(data.get("axis_map", {}), errors)
+    enabled = data.get("media_gestures_enabled", True)
+    if not isinstance(enabled, bool):
+        errors.append("media_gestures_enabled: must be true or false")
+    player = data.get("media_player")
+    if player is not None and (not isinstance(player, str) or not player.strip()):
+        errors.append("media_player: must be a nonempty string or null")
+    bindings = parse_control_bindings(data.get("control_bindings", {}), errors)
     if errors:
         raise SettingsError(errors)
     return GuiSettings(
@@ -137,6 +155,9 @@ def parse_settings(data: object) -> GuiSettings:
         invert_roll=flags["invert_roll"],
         thresholds=thresholds,
         axis_map=axis_map,
+        media_gestures_enabled=enabled,
+        media_player=player,
+        control_bindings=bindings,
     )
 
 

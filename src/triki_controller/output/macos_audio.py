@@ -433,6 +433,7 @@ class MacOSPlayerVolume:
         self._last = self._input = self._position = None
         self._baseline_update = None
         self._saved = {}
+        self._manual_player = None
         self.last_error = None
 
     def leave(self):
@@ -451,8 +452,22 @@ class MacOSPlayerVolume:
             self._input = baseline
         return baseline
 
+    def list_media_players(self) -> list[tuple[str, str]]:
+        return [(name, name) for name in self.adapter.list_players()]
+
+    def select_media_player(self, player_id: str | None) -> None:
+        self._manual_player = player_id
+        self._selected = player_id
+        self._identity = None
+        self.leave()
+
     def _select(self):
         players = self.adapter.list_players()
+        if self._manual_player is not None and self._manual_player not in players:
+            self.leave()
+            raise MacOSAudioError(f"selected player unavailable: {self._manual_player}; no substitution")
+        if self._manual_player is not None:
+            self._selected = self._manual_player
         if not players:
             self._selected = None
             self.leave()

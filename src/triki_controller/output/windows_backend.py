@@ -18,7 +18,7 @@ from triki_controller.core.models import (
 
 _TRANSPORT = {'play_pause', 'next_track', 'previous_track'}
 _VOLUME = {'volume_up', 'volume_down', 'mute', 'cycle_player'}
-_BUTTONS = {'mouse_left', 'mouse_right'}
+from triki_controller.output.binding_input import INPUT_ACTIONS, binding_only, dispatch
 _TELEMETRY = {'knob', 'wheel_deg', 'pitch_deg', 'roll_deg', 'lean_x', 'lean_y',
               'yaw_rate_dps', 'pitch_rate_dps'}
 
@@ -60,6 +60,19 @@ class WindowsOutputBackend:
     def media(self):
         return self.audio
 
+    def list_media_players(self) -> list[tuple[str, str]]:
+        with self._lock:
+            if self.audio is None:
+                from triki_controller.output.windows_audio import WindowsAudio
+                self.audio = WindowsAudio()
+            return self.audio.list_media_players()
+
+    def select_media_player(self, player_id: str | None) -> None:
+        with self._lock:
+            self._media_player = player_id
+            if self.audio is not None:
+                self.audio.select_media_player(player_id)
+
     def take_media_baseline(self):
         """Consume a safe player-target baseline for the runtime mapper."""
         with self._lock:
@@ -73,9 +86,12 @@ class WindowsOutputBackend:
     def open(self, capabilities: dict[str, object]) -> None:
         with self._lock:
             mode = str(capabilities.get('mode') or '')
-            if mode in {'steering', 'plane'}:
+            self._binding_only = mode in {'steering', 'plane'} and binding_only(capabilities)
+            self._ignore_legacy_trigger = (self._binding_only and
+                cast(Any, capabilities['control_bindings']).get('button', 'default') == 'default')
+            if mode in {'steering', 'plane'} and not self._binding_only:
                 raise RuntimeError('Windows virtual gamepad/steering unavailable: requires a virtual HID driver')
-            if mode not in {'media', 'mouse'}:
+            if mode not in {'media', 'mouse', 'steering', 'plane'}:
                 raise RuntimeError(f'unsupported Windows output mode {mode!r}')
             if capabilities.get('dry_run'):
                 raise RuntimeError('WindowsOutputBackend is live-only; select TraceOutput for dry-run')
@@ -91,6 +107,10 @@ class WindowsOutputBackend:
                     from triki_controller.output.windows_audio import WindowsAudio
                     self.audio = WindowsAudio()
                 self._mpris = _PlayerBaseline(self.audio) if self.audio is not None else None
+                if 'media_player' in capabilities:
+                    self.select_media_player(capabilities['media_player'])
+                elif self.audio is not None and hasattr(self, '_media_player'):
+                    self.audio.select_media_player(self._media_player)
                 if self.audio is not None and hasattr(self.audio, 'reset_player'):
                     self.audio.reset_player()
                 self._mode = mode
@@ -124,14 +144,19 @@ class WindowsOutputBackend:
                     errors.append(f'{label}: {exc}')
                     return False
 
-            desired = set(state.held_buttons) | set(state.held_keys)
+            # The mapper's default analog trigger has no native HID target.
+            # Ignore only that legacy button; mapped keys/mouse remain active.
+            buttons = set(state.held_buttons)
+            if self._ignore_legacy_trigger:
+                buttons.discard('trigger')
+            desired = buttons | set(state.held_keys)
             for name in sorted(self._held - desired):
-                if perform(name, self.input.button, name, False):
+                if perform(name, lambda n, d: dispatch(self.input, n, d), name, False):
                     self._held.remove(name)
             for name in sorted(desired - self._held):
-                if name not in _BUTTONS or self._mode != 'mouse':
+                if name not in INPUT_ACTIONS:
                     errors.append(f'unsupported held input {name}')
-                elif perform(name, self.input.button, name, True):
+                elif perform(name, lambda n, d: dispatch(self.input, n, d), name, True):
                     self._held.add(name)
             for pulse in state.pulses:
                 if pulse == 'recenter' and self._mode == 'media':
@@ -142,18 +167,27 @@ class WindowsOutputBackend:
                 elif pulse in _TRANSPORT and self._mode == 'media':
                     # Native global media keys; routing is Windows/app dependent,
                     # not falsely advertised as transport pinned to selected audio.
+                    # Explicit missing pins must never leak global transport.
+                    # Discovery is observational and must not rebase volume.
+                    if getattr(self, '_media_player', None) is not None:
+                        check = getattr(self.audio, 'check_transport_target', None)
+                        if check is None:
+                            errors.append('selected player discovery unavailable; global transport blocked')
+                            continue
+                        if not perform('selected player', check):
+                            continue
                     perform('global media key', self.input.transport, pulse)
-                elif pulse in _BUTTONS and self._mode == 'mouse':
+                elif pulse in INPUT_ACTIONS:
                     if pulse in self._held:
                         errors.append(f'cannot pulse held button {pulse}')
-                    elif perform(pulse, self.input.button, pulse, True):
+                    elif perform(pulse, lambda n, d: dispatch(self.input, n, d), pulse, True):
                         self._held.add(pulse)
-                        if perform(pulse, self.input.button, pulse, False):
+                        if perform(pulse, lambda n, d: dispatch(self.input, n, d), pulse, False):
                             self._held.remove(pulse)
                 elif pulse != 'recenter':
                     errors.append(f'unsupported pulse {pulse}')
             for name, value in state.absolute_axes.items():
-                if name in _TELEMETRY:
+                if name in _TELEMETRY or self._binding_only:
                     continue
                 if name == 'player_volume' and self._mode == 'media':
                     perform('player', self.audio.apply_level, value)
@@ -192,7 +226,7 @@ class WindowsOutputBackend:
             errors = []
             for name in sorted(self._held):
                 try:
-                    self.input.button(name, False)
+                    dispatch(self.input, name, False)
                     self._held.remove(name)
                 except Exception as exc:
                     errors.append(f'release {name}: {exc}')

@@ -71,6 +71,7 @@ class WindowsAudio:
         self._sessions: tuple[PlayerSession, ...] = ()
         self._scan_at = float('-inf')
         self._pinned = None
+        self._manual_player = None
         self._selected = None
         self._last_player = None
         self._player_baseline = self._player_origin = None
@@ -86,12 +87,33 @@ class WindowsAudio:
     def active(self):
         return self._baseline is not None
 
+    def list_media_players(self) -> list[tuple[str, str]]:
+        with self._lock:
+            # sessions() marshals all native enumeration through its COM worker.
+            return [(p.key, p.name) for p in sorted(self.adapter.sessions(), key=lambda p: p.key)]
+
+    def select_media_player(self, player_id: str | None) -> None:
+        with self._lock:
+            self._manual_player = player_id
+            self._pinned = player_id
+            self._selected = None
+            self.reset_player()
+
     def _select(self, force=False):
         now = self._clock()
         if force or now - self._scan_at >= self._scan_interval:
             self._sessions = tuple(sorted(self.adapter.sessions(), key=lambda p: p.key))
             self._scan_at = now
         by_key = {p.key: p for p in self._sessions}
+        if self._manual_player is not None:
+            selected = by_key.get(self._manual_player)
+            if selected is None:
+                self._selected = None
+                raise RuntimeError(f'selected player unavailable: {self._manual_player}; no substitution')
+            if selected.key != self._selected:
+                self._selected = selected.key
+                self.reset_player(invalidate_scan=False)
+            return selected
         if self._pinned not in by_key:
             self._pinned = None
         selected = by_key.get(self._pinned) if self._pinned is not None else None
@@ -142,6 +164,26 @@ class WindowsAudio:
             except Exception as exc:
                 self._failed('player', exc)
                 return None
+
+    def check_transport_target(self):
+        """Validate a manual pin read-only; Auto keeps legacy global transport.
+
+        Native identity discovery does not require readable volume. Older inert
+        adapters can use their scalar session snapshots; discovery errors fail
+        closed and are reported as errors, not as proof the player is missing.
+        """
+        with self._lock:
+            if self._manual_player is None:
+                return None
+            try:
+                available = getattr(self.adapter, 'player_available', None)
+                found = (available(self._manual_player) if available is not None
+                         else any(p.key == self._manual_player for p in self.adapter.sessions()))
+                if not found:
+                    return f'selected player unavailable: {self._manual_player}; no substitution'
+                return None
+            except Exception as exc:
+                return f'selected player discovery failed: {self._manual_player}: {exc}'
 
     def describe_status(self):
         with self._lock:
@@ -295,6 +337,9 @@ class PycawAudioAdapter:
     def sessions(self):
         return self._call('sessions')
 
+    def player_available(self, key):
+        return self._call('player_available', key)
+
     def set_player(self, key, level):
         self._call('set_player', key, _level(level))
 
@@ -388,6 +433,10 @@ class _CoreAudioRuntime:
                 groups[key] = PlayerSession(key, name, previous.active or current.active,
                                             preferred.volume, previous.muted and current.muted)
         return tuple(groups.values())
+
+    def player_available(self, key):
+        # Identity-only enumeration: unreadable/muted volume is not absence.
+        return any(candidate == key for candidate, _, _ in self._sessions())
 
     def _change_player(self, key, method, value):
         found = False

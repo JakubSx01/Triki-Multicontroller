@@ -21,6 +21,7 @@ from triki_controller.core.models import (
 )
 from triki_controller.profiles.axis_map import resolve_axis_map
 from triki_controller.profiles.builtin import Profile
+from triki_controller.profiles.control_bindings import KEY_ACTIONS, parse_control_bindings
 
 _INVERT_ENTER = -0.50
 _INVERT_EXIT = 0.45
@@ -107,10 +108,14 @@ def _tilt_deg(sample: MotionSample, source: str, profile: Profile, sign: float) 
 class DeviceProfileMapper:
     def __init__(self) -> None:
         self._axis_map: dict[str, dict[str, str | float]] = {}
+        self._control_bindings: dict[str, dict[str, str]] = {}
+        self._media_gestures_enabled = True
+        self._active_profile: tuple[str, str, str] | None = None
+        self._active_directions: set[str] = set()
         self._down = False
         self._clicks = 0
         self._last_release_ns: int | None = None
-        self._click_names: dict[int, str] = dict(_MEDIA_CLICKS)
+        self._click_names: dict[int, str | None] = dict(_MEDIA_CLICKS)
         self._volume = 0.5
         self._system_offset = 0.0
         self._system_active = False
@@ -129,7 +134,25 @@ class DeviceProfileMapper:
             name: dict(values) for name, values in stored.items() if isinstance(values, Mapping)
         }
 
+    def set_media_gestures_enabled(self, enabled: bool) -> None:
+        """Enable only shake-to-cycle; mute, transport and volume stay active."""
+        if not isinstance(enabled, bool):
+            raise ValueError("media_gestures_enabled must be a bool")
+        self._media_gestures_enabled = enabled
+        self._shake_run = 0
+        self._shake_last_ns = None
+        self._shake_quiet = True
+
+    def set_control_bindings(self, mapping: Mapping[str, Mapping[str, str]] | None) -> None:
+        """Replace a validated sparse logical overlay, discarding old held/click state."""
+        parsed = parse_control_bindings({} if mapping is None else mapping)
+        self._control_bindings = parsed
+        self.reset()
+
     def reset(self) -> None:
+        """Clear transient state, retaining all configured mappings and toggles."""
+        self._active_profile = None
+        self._active_directions.clear()
         self._down = False
         self._clicks = 0
         self._last_release_ns = None
@@ -166,9 +189,15 @@ class DeviceProfileMapper:
 
     def map(self, sample: MotionSample, profile: Profile) -> MappedState:
         profile = profile.validated()
+        identity = (profile.id, profile.revision, profile.mode)
+        if self._active_profile is not None and self._active_profile != identity:
+            self.reset()
+        self._active_profile = identity
         if sample.stage_status != PipelineStageStatus.AVAILABLE:
+            self.reset()
             return _neutral(sample, profile)
         if sample.tilt_pitch_deg is None or sample.tilt_roll_deg is None:
+            self.reset()
             return _neutral(sample, profile)
 
         spec = resolve_axis_map(self._axis_map)[profile.mode]
@@ -242,8 +271,6 @@ class DeviceProfileMapper:
         Gyro rate does not move the pointer.
         """
         pulses: list[str] = []
-        self._click_names = dict(_MOUSE_CLICKS)
-        self._update_clicks(sample, profile, sample.received_monotonic_ns, pulses)
         dt = sample.dt_s if sample.dt_s is not None and 0 < sample.dt_s <= _MOUSE_GAP_S else 0.0
         spec = resolve_axis_map(self._axis_map)["mouse"]
         x_deg = _tilt_deg(sample, str(spec["x"]), profile, profile.mouse_x_sign)
@@ -320,7 +347,8 @@ class DeviceProfileMapper:
                 self._system_offset = 0.0
                 self._prev_yaw = yaw
             self._update_clicks(sample, profile, now, pulses)
-            self._update_shake(sample, now, pulses, profile)
+            if self._media_gestures_enabled:
+                self._update_shake(sample, now, pulses, profile)
             if align is None or align >= _LEVEL_ALIGN:
                 self._update_volume_endless(yaw, profile)
             else:
@@ -406,7 +434,9 @@ class DeviceProfileMapper:
         if self._clicks and not self._down and self._last_release_ns is not None:
             if now - self._last_release_ns >= window_ns:
                 fallback = next(iter(self._click_names.values()))
-                pulses.append(self._click_names.get(self._clicks, fallback))
+                action = self._click_names.get(self._clicks, fallback)
+                if action is not None:
+                    pulses.append(action)
                 self._clicks = 0
                 self._last_release_ns = None
         if sample.button and not self._down:
@@ -451,6 +481,54 @@ class DeviceProfileMapper:
             self._invert_since_ns = None
             self._upright_since_ns = None
 
+    def _binding_outputs(
+        self, sample: MotionSample, profile: Profile, axes: dict[str, float],
+        legacy_buttons: tuple[str, ...],
+    ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+        bindings = self._control_bindings.get(profile.mode, {})
+        button = bindings.get("button", "default")
+        buttons = list(legacy_buttons if button == "default" else ())
+        keys: list[str] = []
+
+        def hold(action: str) -> None:
+            if action in KEY_ACTIONS:
+                if action not in keys:
+                    keys.append(action)
+            elif action.startswith("mouse_") and action not in buttons:
+                buttons.append(action)
+
+        if sample.button:
+            hold(button)
+        if profile.mode == "steering":
+            x = axes.get("wheel", 0.0)
+            forward, backward = axes.get("throttle", 0.0), axes.get("brake", 0.0)
+        else:
+            prefix = "lean" if profile.mode == "mouse" else "stick"
+            x, y = axes.get(f"{prefix}_x", 0.0), axes.get(f"{prefix}_y", 0.0)
+            forward, backward = max(0.0, -y), max(0.0, y)
+        strengths = {"left": max(0.0, -x), "right": max(0.0, x),
+                     "forward": forward, "backward": backward}
+        for source, strength in strengths.items():
+            active = strength >= 0.20 or (source in self._active_directions and strength > 0.15)
+            if active:
+                self._active_directions.add(source)
+                hold(bindings.get(source, "default"))
+            else:
+                self._active_directions.discard(source)
+
+        # Held-button overrides suppress *implicit* legacy mouse clicks. Explicit
+        # click bindings may coexist with a held binding, including button=off.
+        legacy_clicks = _MOUSE_CLICKS if profile.mode == "mouse" and button == "default" else {}
+        self._click_names = {}
+        for count, source in enumerate(("click", "double_click", "triple_click"), 1):
+            action = bindings.get(source, "default")
+            self._click_names[count] = legacy_clicks.get(count, legacy_clicks.get(1)) if action == "default" else (
+                None if action == "off" else action
+            )
+        pulses: list[str] = []
+        self._update_clicks(sample, profile, sample.received_monotonic_ns, pulses)
+        return tuple(buttons), tuple(keys), tuple(pulses)
+
     def _state(
         self,
         sample: MotionSample,
@@ -463,6 +541,12 @@ class DeviceProfileMapper:
     ) -> MappedState:
         axes = absolute_axes or {}
         deltas = relative_deltas or {}
+        held_keys: tuple[str, ...] = ()
+        if profile.mode != "media":
+            held_buttons, held_keys, extra_pulses = self._binding_outputs(
+                sample, profile, axes, held_buttons
+            )
+            pulses = (*pulses, *extra_pulses)
         for value in (*axes.values(), *deltas.values()):
             if not math.isfinite(value):
                 raise ValueError("mapped value must be finite")
@@ -475,7 +559,7 @@ class DeviceProfileMapper:
             profile_revision=profile.revision,
             activation_epoch=0,
             held_buttons=held_buttons,
-            held_keys=(),
+            held_keys=held_keys,
             absolute_axes=axes,
             relative_deltas=deltas,
             stage_status=PipelineStageStatus.AVAILABLE,

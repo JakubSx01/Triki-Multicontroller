@@ -88,7 +88,7 @@ class WindowsInput:
 
     def button(self, name, down):
         with self._lock:
-            flags = {'mouse_left': (2, 4), 'mouse_right': (8, 16)}.get(name)
+            flags = {'mouse_left': (2, 4), 'mouse_right': (8, 16), 'mouse_middle': (32, 64)}.get(name)
             if flags is None:
                 raise ValueError(f'unsupported Windows button {name!r}')
             self._send(INPUT(type=0, data=_INPUTUNION(mi=MOUSEINPUT(dwFlags=flags[0 if down else 1]))))
@@ -98,11 +98,22 @@ class WindowsInput:
                 self._buttons.discard(name)
 
     def _key(self, vk, down):
-        self._send(INPUT(type=1, data=_INPUTUNION(ki=KEYBDINPUT(wVk=vk, dwFlags=0 if down else 2))))
+        self._send(INPUT(type=1, data=_INPUTUNION(ki=KEYBDINPUT(wVk=vk, dwFlags=(1 if vk in {0x25, 0x26, 0x27, 0x28} else 0) | (0 if down else 2)))))
         if down:
             self._keys.add(vk)
         else:
             self._keys.discard(vk)
+
+    def key(self, name, down):
+        with self._lock:
+            codes = {'key_' + c: ord(c.upper()) for c in 'abcdefghijklmnopqrstuvwxyz0123456789'}
+            codes.update({'key_' + n: v for n, v in {
+                'up': 0x26, 'down': 0x28, 'left': 0x25, 'right': 0x27,
+                'space': 0x20, 'enter': 0x0d, 'escape': 0x1b, 'shift': 0x10,
+                'ctrl': 0x11, 'alt': 0x12, 'tab': 0x09, 'backspace': 0x08}.items()})
+            if name not in codes:
+                raise ValueError(f'unsupported Windows key {name!r}')
+            self._key(codes[name], down)
 
     def transport(self, name):
         with self._lock:

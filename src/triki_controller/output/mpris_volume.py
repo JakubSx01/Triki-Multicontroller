@@ -93,9 +93,50 @@ class MprisPlayerVolume:
         self._cached_identity: str | None = None
         self._cached_player: str | None = None
         self._pinned_player: str | None = None
+        self._manual_player: str | None = None
         self._volume_scan_mono = 0.0
         self.last_error: str | None = None
         self.log: list[str] = []
+        self._manual_baseline = self._manual_origin = self._baseline_update = None
+        self._manual_rebase = False
+        self._translation_player = None
+
+    def list_media_players(self) -> list[tuple[str, str]]:
+        binary = self._resolve_playerctl()
+        if binary is None:
+            return []
+        # Listing is observational: do not use _read_identity (it changes caches).
+        return [(name, self._friendly_name(name, None)) for name in self._list_players(binary)]
+
+    def select_media_player(self, player_id: str | None) -> None:
+        self._manual_player = player_id
+        self._manual_rebase = True
+        self._manual_baseline = self._manual_origin = self._baseline_update = None
+        self._pinned_player = player_id
+        self._cached_player = self._cached_identity = None
+        self._last_set = self._last_applied_player = None
+        self._saved_volume = None
+        self._muted = False
+        self._volume_scan_mono = 0.0
+
+    def reset_player(self):
+        # Legacy automatic mode remains direct; explicit picker translations
+        # must be rearmed when runtime recenter/connect captures a fresh level.
+        if self._manual_baseline is not None or self._manual_rebase:
+            self._manual_rebase = True
+            self._manual_baseline = self._manual_origin = self._baseline_update = None
+            self._last_set = self._last_applied_player = None
+
+    def take_media_baseline(self):
+        # Linux receipts can report soft volume failures as applied input frames.
+        # Keep the update pending until player-volume delivery succeeds.
+        if self.last_error:
+            return None
+        baseline = self._baseline_update
+        self._baseline_update = None
+        if baseline is not None:
+            self._manual_origin = baseline
+        return baseline
 
     def handles(self, pulse: str) -> bool:
         return pulse in _VOLUME_PULSES
@@ -104,7 +145,8 @@ class MprisPlayerVolume:
         return pulse in _TRANSPORT_PULSES
 
     def read_volume(self) -> float | None:
-        """Current player volume in [0, 1], or None if unavailable / dry-run."""
+        """Explicit runtime baseline read; status/listing stay observational."""
+        self.reset_player()
         if self._dry_run:
             return self._last_set if self._last_set is not None else 0.5
         binary = self._resolve_playerctl()
@@ -163,7 +205,9 @@ class MprisPlayerVolume:
                 detail=detail,
             )
         active = self._select_player(binary, players)
-        assert active is not None
+        if active is None:
+            return MprisPlayerStatus(True, players, None, None, None, None,
+                                     self.last_error or "selected player unavailable")
         identity = self._read_identity(binary, active)
         volume = self._read_volume(binary, active)
         stream_volume = None
@@ -243,13 +287,34 @@ class MprisPlayerVolume:
             return self.last_error
         player = self._player_for_volume(binary)
         if player is None:
-            self.last_error = "mpris: brak odtwarzacza MPRIS — głośność niedostępna"
+            self.last_error = self.last_error or "mpris: brak odtwarzacza MPRIS — głośność niedostępna"
             return self.last_error
+        if self._manual_baseline is not None and player != self._translation_player:
+            self.reset_player()
+        if self._manual_rebase:
+            actual = self.read_volume()
+            if actual is None:
+                return self.last_error or "selected player volume unavailable"
+            self._translation_player = self._cached_player
+            self._manual_baseline = actual
+            self._manual_origin = target
+            self._baseline_update = actual
+            # A read-only rebase already knows the target's current level;
+            # do not issue a redundant write on the first synchronized frame.
+            self._last_set = actual
+            self._last_applied_player = player
+            self._manual_rebase = False
+            self.last_error = None
+            return None
+        if self._manual_baseline is not None:
+            target = max(0.0, min(1.0, self._manual_baseline + target - self._manual_origin))
         if (
             player == self._last_applied_player
             and self._last_set is not None
             and abs(target - self._last_set) < _VOLUME_EPSILON
+            and (target not in (0.0, 1.0) or target == self._last_set)
         ):
+            self.last_error = None
             return None
         if self._muted:
             return None
@@ -293,7 +358,7 @@ class MprisPlayerVolume:
             return self.last_error
         player = self._select_player(binary)
         if player is None:
-            self.last_error = "mpris: brak odtwarzacza MPRIS — głośność niedostępna"
+            self.last_error = self.last_error or "mpris: brak odtwarzacza MPRIS — głośność niedostępna"
             return self.last_error
         if self._volume_writable_for(player) is False and pulse != "mute":
             if not self._should_use_stream(player):
@@ -302,10 +367,14 @@ class MprisPlayerVolume:
                 return self.last_error
         try:
             if pulse == "volume_up":
-                return self._nudge(binary, player, +self._step)
-            if pulse == "volume_down":
-                return self._nudge(binary, player, -self._step)
-            return self._toggle_mute(binary, player)
+                result = self._nudge(binary, player, +self._step)
+            elif pulse == "volume_down":
+                result = self._nudge(binary, player, -self._step)
+            else:
+                result = self._toggle_mute(binary, player)
+            if result is None:
+                self.reset_player()
+            return result
         except (OSError, subprocess.TimeoutExpired) as exc:
             self.last_error = f"mpris: {exc}"
             return self.last_error
@@ -325,7 +394,7 @@ class MprisPlayerVolume:
             return "mpris: brak playerctl"
         player = self._select_player(binary)
         if player is None:
-            return "mpris: brak odtwarzacza dla transportu"
+            return self.last_error or "mpris: brak odtwarzacza dla transportu"
         try:
             err = self._exec(binary, player, [command])
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -371,6 +440,8 @@ class MprisPlayerVolume:
 
     def _player_for_volume(self, binary: str) -> str | None:
         """Reuse the last player until the rescan interval elapses."""
+        if self._manual_player is not None:
+            return self._select_player(binary)
         if (time.monotonic() - self._volume_scan_mono) < _VOLUME_RESCAN_S:
             return self._pinned_player or self._cached_player
         return self._select_player(binary)
@@ -381,6 +452,15 @@ class MprisPlayerVolume:
         """Pick active player. A shake-pin wins until the player disappears."""
         self._volume_scan_mono = time.monotonic()
         listed = players if players is not None else self._list_players(binary)
+        if self._manual_player is not None:
+            if self._manual_player not in listed:
+                self._cached_player = None
+                self._manual_rebase = True
+                self._manual_baseline = self._manual_origin = self._baseline_update = None
+                self.last_error = f"mpris: selected player unavailable: {self._manual_player}; no substitution"
+                return None
+            self._cached_player = self._manual_player
+            return self._manual_player
         if not listed:
             self._cached_player = None
             self._pinned_player = None

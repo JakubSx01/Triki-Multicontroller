@@ -33,7 +33,11 @@ _KEYS = {
 }
 _MEDIA_TRANSPORT = frozenset({"play_pause", "next_track", "previous_track"})
 _MEDIA_VOLUME = frozenset({"volume_up", "volume_down", "mute", "cycle_player"})
-_BUTTONS = {"mouse_left": "BTN_LEFT", "mouse_right": "BTN_RIGHT", "trigger": "BTN_TRIGGER"}
+from triki_controller.output.binding_input import KEY_ACTIONS, MOUSE_ACTIONS
+_KEYS.update({name: 'KEY_' + name[4:].upper() for name in KEY_ACTIONS})
+_KEYS.update({'key_enter': 'KEY_ENTER', 'key_ctrl': 'KEY_LEFTCTRL',
+              'key_shift': 'KEY_LEFTSHIFT', 'key_alt': 'KEY_LEFTALT', 'key_escape': 'KEY_ESC'})
+_BUTTONS = {"mouse_left": "BTN_LEFT", "mouse_right": "BTN_RIGHT", "mouse_middle": "BTN_MIDDLE", "trigger": "BTN_TRIGGER"}
 
 
 class UInputBackend:
@@ -80,15 +84,38 @@ class UInputBackend:
     def mpris(self) -> MprisPlayerVolume | None:
         return self._mpris
 
+    def read_player_volume(self):
+        return self._mpris.read_volume() if self._mpris is not None else None
+
+    def list_media_players(self) -> list[tuple[str, str]]:
+        if self._mpris is None:
+            self._mpris = MprisPlayerVolume()
+            self._mpris_owned = True
+        return self._mpris.list_media_players()
+
+    def select_media_player(self, player_id: str | None) -> None:
+        self._media_player = player_id
+        if self._mpris is not None:
+            self._mpris.select_media_player(player_id)
+
+    def take_media_baseline(self):
+        return self._mpris.take_media_baseline() if self._mpris is not None else None
+
     def open(self, capabilities: dict[str, object]) -> None:
         if not capabilities.get("claim_uinput"):
             raise RuntimeError("UInputBackend requires claim_uinput")
         mode = str(capabilities.get("mode") or "")
         if mode not in {"steering", "mouse", "plane", "media"}:
             raise RuntimeError(f"unsupported uinput mode {mode!r}")
+        if self._ui is not None:
+            self.close()  # Never replace a device with unresolved key releases.
         ecodes, UInput, AbsInfo = _load_evdev()
         self._ecodes = ecodes
         events = _capabilities(ecodes, AbsInfo, mode)
+        events.setdefault(ecodes.EV_KEY, []).extend(
+            getattr(ecodes, _KEYS.get(name) or _BUTTONS[name])
+            for name in sorted(KEY_ACTIONS | MOUSE_ACTIONS)
+            if getattr(ecodes, _KEYS.get(name) or _BUTTONS[name]) not in events[ecodes.EV_KEY])
         name = str(capabilities.get("device_name") or f"Triki {mode}")
         self._ui = UInput(
             events=events,
@@ -115,6 +142,10 @@ class UInputBackend:
             if self._system is None or self._system_owned:
                 self._system = SystemMixer(dry_run=dry_run)
                 self._system_owned = True
+            if 'media_player' in capabilities:
+                self.select_media_player(capabilities['media_player'])
+            elif hasattr(self, '_media_player'):
+                self._mpris.select_media_player(self._media_player)
         elif self._mpris_owned:
             self._mpris = None
             if self._system is not None:
@@ -157,14 +188,24 @@ class UInputBackend:
             )
         ignored: list[str] = []
         notes: list[str] = []
+        input_errors = []
         desired = set(state.held_buttons) | set(state.held_keys)
         for name in sorted(self._held - desired):
-            if not self._write_button(name, 0):
-                ignored.append(name)
+            try:
+                if self._write_button(name, 0):
+                    self._held.remove(name)
+                else:
+                    ignored.append(name)
+            except Exception as exc:
+                input_errors.append(f'release {name}: {exc}')
         for name in sorted(desired - self._held):
-            if not self._write_button(name, 1):
-                ignored.append(name)
-        self._held = {name for name in desired if name in _BUTTONS or name in _KEYS}
+            try:
+                if self._write_button(name, 1):
+                    self._held.add(name)
+                else:
+                    ignored.append(name)
+            except Exception as exc:
+                input_errors.append(f'press {name}: {exc}')
         pending_volume: float | None = None
         pending_system: float | None = None
         for name, value in state.absolute_axes.items():
@@ -202,16 +243,34 @@ class UInputBackend:
                     notes.append(err)
                 continue
             if self._mode == "media" and pulse in _MEDIA_TRANSPORT:
-                if self._mpris is not None and self._mpris.handles_transport(pulse):
-                    err = self._mpris.apply_transport(pulse)
-                    if err is None:
-                        continue
+                err = "mpris: transport unavailable"
+                try:
+                    if self._mpris is not None and self._mpris.handles_transport(pulse):
+                        err = self._mpris.apply_transport(pulse)
+                        if err is None:
+                            continue
+                except Exception as exc:
+                    err = f"mpris: transport {pulse}: {exc}"
+                # A manual identity is a routing constraint, not a preference.
+                # No discovery/runtime failure may escape to global media keys.
+                manual_player = getattr(self, "_media_player",
+                                        getattr(self._mpris, "_manual_player", None))
+                if manual_player is not None:
+                    input_errors.append(err)
+                    continue
+                if self._mpris is not None:
                     notes.append(f"{err}; fallback uinput {pulse}")
+                try:
+                    if not self._pulse(pulse):
+                        ignored.append(pulse)
+                except Exception as exc:
+                    input_errors.append(f'pulse {pulse}: {exc}')
+                continue
+            try:
                 if not self._pulse(pulse):
                     ignored.append(pulse)
-                continue
-            if not self._pulse(pulse):
-                ignored.append(pulse)
+            except Exception as exc:
+                input_errors.append(f'pulse {pulse}: {exc}')
         if pending_volume is not None:
             if self._mpris is None:
                 notes.append("mpris: unavailable for player_volume")
@@ -233,17 +292,24 @@ class UInputBackend:
             detail = "uinput+mpris apply"
         if ignored:
             detail += "; ignored " + ",".join(ignored)
+        applied = not ignored and not input_errors
+        notes.extend(input_errors)
         if self._cursor_note:
             notes.append(self._cursor_note)
         if notes:
             detail += "; " + "; ".join(notes)
-        return self._receipt(state, applied=True, reason=None, detail=detail)
+        return self._receipt(state, applied=applied, reason=None, detail=detail)
 
     def neutralize(self, reason: str) -> OutputReceipt:
+        errors = []
         if self._ui is not None and self._ecodes is not None:
             for name in sorted(self._held):
-                self._write_button(name, 0)
-            self._held.clear()
+                try:
+                    self._write_button(name, 0)
+                    self._ui.syn()
+                    self._held.remove(name)
+                except Exception as exc:
+                    errors.append(f'release {name}: {exc}')
             if self._mode == "steering":
                 for name in ("wheel", "throttle", "brake"):
                     self._write_axis(name, 0.0)
@@ -260,7 +326,9 @@ class UInputBackend:
                 self._cursor_note = f"kursor absolutny: {exc}"
         if self._system is not None:
             self._system.leave()
-        self._dirty = False
+        if self._mpris is not None and hasattr(self._mpris, 'reset_player'):
+            self._mpris.reset_player()
+        self._dirty = bool(self._held)
         self._epoch += 1
         receipt = OutputReceipt(
             schema_version=SCHEMA_VERSION,
@@ -270,17 +338,22 @@ class UInputBackend:
             activation_epoch=self._epoch,
             backend=self.BACKEND_NAME,
             emitted_monotonic_ns=time.monotonic_ns(),
-            applied=True,
+            applied=not errors,
             dry_run=False,
             neutralization_reason=reason,
-            detail="released held inputs; axes neutral",
-            stage_status=PipelineStageStatus.AVAILABLE,
+            detail="; ".join(errors) or "released held inputs; axes neutral",
+            stage_status=PipelineStageStatus.AVAILABLE if not errors else PipelineStageStatus.ERROR,
         )
         return receipt
 
     def close(self) -> None:
-        if self.opened and not self.closed and self._dirty:
-            self.neutralize("close")
+        # Disarm immediately, but retain the device and held set for retries.
+        # closed means all owned resources actually closed, not merely requested.
+        self.opened = False
+        if self._dirty or self._held:
+            receipt = self.neutralize("close")
+            if not receipt.applied:
+                raise RuntimeError(receipt.detail)
         if self._cursor is not None:
             self._cursor.close()
             self._cursor = None
@@ -297,6 +370,9 @@ class UInputBackend:
         # Media transport only — volume keys are not registered on the device.
         if self._mode == "media" and name in _MEDIA_VOLUME:
             return False
+        if name in KEY_ACTIONS or name in MOUSE_ACTIONS:
+            self._ui.write(self._ecodes.EV_KEY, getattr(self._ecodes, code_name), value)
+            return True
         if self._mode == "media" and name not in _MEDIA_TRANSPORT and name not in _BUTTONS:
             return False
         if self._mode == "plane" and name != "trigger":
@@ -308,10 +384,15 @@ class UInputBackend:
         return True
 
     def _pulse(self, name: str) -> bool:
+        if name in self._held:
+            return False
         if not self._write_button(name, 1):
             return False
+        self._held.add(name)
         self._ui.syn()
         self._write_button(name, 0)
+        self._ui.syn()
+        self._held.remove(name)
         return True
 
     def _write_axis(self, name: str, value: float) -> bool:
@@ -390,7 +471,7 @@ class UInputBackend:
             dry_run=False,
             neutralization_reason=reason,
             detail=detail,
-            stage_status=PipelineStageStatus.AVAILABLE,
+            stage_status=PipelineStageStatus.AVAILABLE if applied else PipelineStageStatus.ERROR,
         )
 
 

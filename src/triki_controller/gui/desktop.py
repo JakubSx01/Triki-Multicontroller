@@ -11,6 +11,7 @@ import argparse
 import sys
 import time
 import tkinter as tk
+from dataclasses import replace
 from tkinter import messagebox
 from typing import Any, Callable
 
@@ -52,6 +53,7 @@ from triki_controller.gui.present import (
     steering_preview,
 )
 from triki_controller.gui.preview_cards import PreviewDashboard
+from triki_controller.gui.control_options import ControlOptions, _focusable
 from triki_controller.gui.session import ControllerSession
 from triki_controller.gui.settings import (
     PROFILE_NAMES,
@@ -491,9 +493,12 @@ class ConfigForm(ctk.CTkFrame):
         settings: GuiSettings,
         *,
         on_draft: Callable[[GuiSettings], str | None] | None = None,
+        list_players: Callable[[], list[tuple[str, str]]] | None = None,
     ) -> None:
         super().__init__(parent, fg_color="transparent")
         self._on_draft = on_draft
+        self._settings = settings
+        self.control_options: dict[str, ControlOptions] = {}
         self._draft = resolved_draft(settings)
         self._suppress = False
         self.invert_pitch = tk.BooleanVar(value=bool(self._draft["invert_pitch"]))
@@ -544,6 +549,11 @@ class ConfigForm(ctk.CTkFrame):
                 self._add_map(page, name, field, profile_map)
             for field in SLIDER_FIELDS[name]:
                 self._add_slider(page, name, field, profile_thresholds)
+            options = ControlOptions(page, replace(settings, profile=name),
+                                     on_change=lambda _settings: self._emit_draft(),
+                                     list_players=list_players)
+            options.pack(fill="x", pady=(8, 0))
+            self.control_options[name] = options
         initial = PROFILE_LABELS.get(str(self._draft["profile"]), PROFILE_LABELS["steering"])
         try:
             self.tabs.set(initial)
@@ -697,12 +707,18 @@ class ConfigForm(ctk.CTkFrame):
             "thresholds": thresholds,
             "axis_map": axis_map,
         }
-        return settings_from_draft(draft, profile=profile)
+        collected = replace(settings_from_draft(draft, profile=profile),
+                            media_gestures_enabled=self._settings.media_gestures_enabled,
+                            media_player=self._settings.media_player,
+                            control_bindings=self._settings.control_bindings)
+        for options in self.control_options.values():
+            collected = options.collect(collected)
+        return collected
 
-    def _emit_draft(self) -> None:
+    def _emit_draft(self) -> str | None:
         if self._suppress or self._on_draft is None:
-            return
-        self._on_draft(GuiSettings())
+            return None
+        return self._on_draft(GuiSettings())
 
     @staticmethod
     def _sign_value(label: str) -> float:
@@ -746,6 +762,7 @@ class TrikiDesktop:
         self._dirty = False
         self._saved_settings = session.current_settings()
         self._config_form: ConfigForm | None = None
+        self._control_options: ControlOptions | None = None
         self._sensors: SensorBoard | None = None
         self._preview: OutputPreview | None = None
         self._dashboard: PreviewDashboard | None = None
@@ -806,6 +823,7 @@ class TrikiDesktop:
         self._preview = None
         self._dashboard = None
         self._nav_buttons = {}
+        self._control_options = None
 
     def _build(self) -> None:
         if self.view == "quick":
@@ -865,6 +883,31 @@ class TrikiDesktop:
         from triki_controller.gui.shell_presentation import build_device_screen
 
         build_device_screen(self, title, from_menu=from_menu)
+        outer = self._content.winfo_children()[0]
+        options_area = ctk.CTkScrollableFrame(outer, fg_color="transparent", height=230)
+        options_area.pack(fill="x", pady=(0, 8), before=outer.pack_slaves()[2])
+        self._control_options = ControlOptions(
+            options_area, self.session.current_settings(), on_change=self._apply_control_options,
+            list_players=self.session.list_media_players)
+        self._control_options.pack(fill="x")
+        save_button = ctk.CTkButton(options_area, text="Zapisz", command=self._save_config,
+                                   fg_color=_ACCENT)
+        save_button.pack(anchor="w", pady=4)
+        _focusable(save_button, save_button.invoke)
+        self.root.geometry("660x820")
+        self.root.minsize(620, 700)
+
+    def _apply_control_options(self, settings: GuiSettings) -> str | None:
+        # Apply only added controls onto the latest session draft.
+        current = self.session.current_settings()
+        candidate = replace(current, control_bindings=settings.control_bindings,
+                            media_player=settings.media_player,
+                            media_gestures_enabled=settings.media_gestures_enabled)
+        error = self.session.apply_settings(candidate)
+        if error is None:
+            self._dirty = True
+            self._dirty_label.set("Niezapisane zmiany")
+        return error
 
     def _back_to_menu_from_device(self) -> None:
         self.session.stop_output()
@@ -1077,7 +1120,8 @@ class TrikiDesktop:
         pad.pack(fill="both", expand=True, padx=10, pady=8)
         ctk.CTkLabel(pad, text="Mapowanie i progi", text_color=_MUTED, anchor="w").pack(anchor="w")
         self._config_form = ConfigForm(
-            pad, self.session.current_settings(), on_draft=self._apply_draft_from_form
+            pad, self.session.current_settings(), on_draft=self._apply_draft_from_form,
+            list_players=self.session.list_media_players,
         )
         self._config_form.pack(fill="both", expand=True)
         # Rebind on_draft properly — ConfigForm calls with GuiSettings(); use wrapper.
@@ -1187,7 +1231,8 @@ class TrikiDesktop:
             self._flash(err)
             self._profile.set(self.session.snapshot().profile_name)
             return
-        self._persist_quiet()
+        self._dirty = True
+        self._dirty_label.set("Niezapisane zmiany")
         self._flash(f"Profil: {PROFILE_LABELS.get(name, name)}")
 
     def _on_dry(self) -> None:
@@ -1218,6 +1263,9 @@ class TrikiDesktop:
     def _save_config(self) -> None:
         form = self._config_form
         if form is None:
+            self._persist_quiet()
+            if self._control_options is not None and not self._dirty:
+                self._control_options.message.set(f"Zapisano {self.settings_path}")
             return
         current = self.session.current_settings()
         try:
