@@ -1,0 +1,16 @@
+{
+  "project": "Phosphor Icons / web",
+  "version": "2.1.2",
+  "commit": "70854726d7bd82ae21f0dc81b5b5c35240a77066",
+  "license": "MIT",
+  "files": {
+    "Phosphor.ttf": {
+      "source": "https://raw.githubusercontent.com/phosphor-icons/web/70854726d7bd82ae21f0dc81b5b5c35240a77066/src/regular/Phosphor.ttf",
+      "sha256": "06b91e022b7ee899a63efced879392a74f0bacbda54e4467e9f663220d173a10"
+    },
+    "LICENSE": {
+      "source": "https://raw.githubusercontent.com/phosphor-icons/web/70854726d7bd82ae21f0dc81b5b5c35240a77066/LICENSE",
+      "sha256": "687fbe52d0eb5c2353eca27a4037e889145ee0b584d3b1abf67581c4a4a4e47c"
+    }
+  }
+}

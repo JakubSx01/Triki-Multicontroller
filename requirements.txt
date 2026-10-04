@@ -1,0 +1,33 @@
+# Runtime dependencies for a source checkout of Triki Controller.
+# Keep this file aligned with pyproject.toml [project.optional-dependencies].
+#
+# The core package has no third-party dependencies (fake transport, parser, CLI).
+#   python3 -m pip install -e .
+#   PYTHONPATH=src python3 -m triki_controller.cli.main --help
+#
+# This file installs the desktop runtime: Tk GUI, BLE, and Linux system input.
+#   python3 -m pip install -r requirements.txt
+#   python3 -m pip install -e .
+#
+# The same sets, one extra at a time:
+#   python3 -m pip install -e '.[gui]'     # Tkinter desktop (CustomTkinter + Pillow)
+#   python3 -m pip install -e '.[ble]'     # live BLE (bleak); needs BlueZ on Linux
+#   python3 -m pip install -e '.[uinput]'  # Linux /dev/uinput only
+#   python3 -m pip install -e '.[gui,ble,uinput]'
+#
+# Not in the extras above (optional tray and binary packaging):
+#   packaging/requirements-desktop.txt   # PyInstaller, pystray, and the same GUI/BLE pins
+# pystray is only the tray icon. The window still opens if it is missing.
+
+# extra: gui — default Tkinter desktop. Also install the OS Tk package
+# (for example python3-tk on Debian/Ubuntu/Arch).
+customtkinter>=5.2.0
+Pillow>=10
+
+# extra: ble — optional live scan/connect to a physical Triki
+bleak>=0.22.0
+
+# extra: uinput — optional live mouse, wheel, and media keys.
+# The marker skips these on Windows and macOS; the GUI still runs there.
+evdev>=1.6; sys_platform == "linux"
+pywayland>=0.4; sys_platform == "linux"

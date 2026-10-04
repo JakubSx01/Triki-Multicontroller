@@ -1,0 +1,9 @@
+# Build dependencies only; original pyproject.toml and lockfiles are untouched.
+PyInstaller==6.22.3
+customtkinter>=5.2,<6
+bleak>=0.22,<3
+Pillow>=10,<13
+pystray==0.19.5
+# Keep the existing Linux live output and Wayland pointer support in Linux bundles.
+evdev>=1.6; sys_platform == "linux"
+pywayland>=0.4; sys_platform == "linux"

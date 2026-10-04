@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "triki-controller"
+version = "0.1.0"
+description = "Linux Triki CAP001 controller — RAW diagnostics plus steering, mouse, and media emulators"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "HomelabPowered" }]
+dependencies = []
+
+[project.optional-dependencies]
+# Bleak is optional; offline fake + hypothesis parser tests do not require it.
+ble = ["bleak>=0.22.0"]
+uinput = ["evdev>=1.6", "pywayland>=0.4"]
+gui = ["customtkinter>=5.2.0", "Pillow>=10"]
+dev = []
+
+[project.scripts]
+triki-controller = "triki_controller.cli.main:main"
+triki-controller-gui = "triki_controller.gui.launch:gui_main"
+triki-controller-config = "triki_controller.gui.launch:config_main"
+triki-controller-mouse = "triki_controller.gui.launch:mouse_main"
+triki-controller-wheel = "triki_controller.gui.launch:wheel_main"
+triki-controller-music = "triki_controller.gui.launch:music_main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+triki_controller = ["py.typed", "gui/assets/**/*"]
