@@ -7,3 +7,11 @@ pystray==0.19.5
 # Keep the existing Linux live output and Wayland pointer support in Linux bundles.
 evdev>=1.6; sys_platform == "linux"
 pywayland>=0.4; sys_platform == "linux"
+# Native Windows Core Audio; never installed into Linux/macOS bundles.
+pycaw>=20260927; sys_platform == "win32"
+comtypes>=1.4.8; sys_platform == "win32"
+psutil>=5.9; sys_platform == "win32"
+# Native macOS application audio and pointer adapters.
+pyobjc-framework-Cocoa; sys_platform == "darwin"
+pyobjc-framework-ScriptingBridge; sys_platform == "darwin"
+pyobjc-framework-Quartz; sys_platform == "darwin"
