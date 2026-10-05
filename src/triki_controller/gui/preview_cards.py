@@ -78,7 +78,6 @@ class SteeringPreviewCard(_Card):
         super().__init__(parent, "Kierownica")
         content = ctk.CTkFrame(self.body, fg_color="transparent")
         content.pack(fill="both", expand=True)
-
         left = ctk.CTkFrame(content, fg_color="transparent")
         left.pack(side="left", fill="both", expand=True)
         self._canvas = _meter_canvas(left, width=235, height=145)
@@ -91,7 +90,6 @@ class SteeringPreviewCard(_Card):
             font=("", 13, "bold"),
             anchor="center",
         ).pack(fill="x", pady=(0, 2))
-
         pedals = ctk.CTkFrame(content, fg_color="transparent")
         pedals.pack(side="right", fill="y", padx=(10, 0), pady=(4, 0))
         self._gas_canvas = _meter_canvas(pedals, width=44, height=105)
@@ -167,7 +165,6 @@ class MousePreviewCard(_Card):
         content.pack(fill="both", expand=True)
         self._canvas = _meter_canvas(content, width=190, height=165)
         self._canvas.pack(side="left", padx=(4, 10))
-
         info = ctk.CTkFrame(content, fg_color="transparent")
         info.pack(side="left", fill="both", expand=True, pady=(16, 0))
         self._x = tk.StringVar(value="X  —")
@@ -252,7 +249,6 @@ class PlanePreviewCard(_Card):
         content.pack(fill="both", expand=True)
         self._canvas = _meter_canvas(content, width=190, height=165)
         self._canvas.pack(side="left", padx=(4, 10))
-
         info = ctk.CTkFrame(content, fg_color="transparent")
         info.pack(side="left", fill="both", expand=True, pady=(20, 0))
         self._x = tk.StringVar(value="X  —")
@@ -314,7 +310,6 @@ class MediaPreviewCard(_Card):
         self._default_player = load_default_player()
         self._source_signature: tuple[tuple[str, ...], str | None, str | None] | None = None
         self._source_buttons: dict[str, tuple[ctk.CTkButton, ctk.CTkButton]] = {}
-
         self._vol = tk.StringVar(value="Odtwarzacz —   Głośność —")
         ctk.CTkLabel(
             self.body,
@@ -332,7 +327,6 @@ class MediaPreviewCard(_Card):
         )
         self._volume_bar.pack(fill="x", pady=(2, 7))
         self._draw_volume(None)
-
         ctk.CTkLabel(
             self.body,
             text="Źródła multimedialne",
@@ -349,7 +343,6 @@ class MediaPreviewCard(_Card):
             scrollbar_button_hover_color=_MUTED,
         )
         self._sources.pack(fill="x", pady=(3, 7))
-
         bottom = ctk.CTkFrame(self.body, fg_color="transparent")
         bottom.pack(fill="x")
         self._action = tk.StringVar(value="Ostatnia akcja: —")
@@ -378,13 +371,8 @@ class MediaPreviewCard(_Card):
         return status
 
     def _select_source(self, player: str) -> None:
-        status = self._media_status(force=True)
-        if player not in status.players:
+        if self._mpris.select_player(player) is not None:
             return
-        # The configurator owns this MPRIS selector. Pinning makes subsequent
-        # status/volume reads follow the clicked source instead of list order.
-        self._mpris._pinned_player = player  # type: ignore[attr-defined]
-        self._mpris._cached_player = player  # type: ignore[attr-defined]
         self._mpris_status = None
         self._last_mpris_poll = 0.0
         self._source_signature = None
@@ -402,10 +390,6 @@ class MediaPreviewCard(_Card):
     def _refresh_sources(self, status: object) -> None:
         players = tuple(getattr(status, "players", ()) or ())
         active = getattr(status, "active_player", None)
-        if self._default_player in players and getattr(self._mpris, "_pinned_player", None) is None:
-            self._mpris._pinned_player = self._default_player  # type: ignore[attr-defined]
-            self._mpris._cached_player = self._default_player  # type: ignore[attr-defined]
-            active = self._default_player
         signature = (players, active, self._default_player)
         if signature == self._source_signature:
             return
@@ -522,14 +506,12 @@ class PreviewDashboard(ctk.CTkFrame):
             text_color=_MUTED,
             anchor="w",
         ).pack(anchor="w", pady=(0, 10))
-
         grid = ctk.CTkFrame(self, fg_color="transparent")
         grid.pack(fill="both", expand=True)
         grid.grid_columnconfigure(0, weight=1, uniform="preview")
         grid.grid_columnconfigure(1, weight=1, uniform="preview")
         grid.grid_rowconfigure(0, weight=1)
         grid.grid_rowconfigure(1, weight=1)
-
         self.steering = SteeringPreviewCard(grid)
         self.mouse = MousePreviewCard(grid)
         self.plane = PlanePreviewCard(grid)
