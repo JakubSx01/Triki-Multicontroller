@@ -6,27 +6,27 @@ player changes. The pot never uses KEY_VOLUMEUP. When MPRIS Volume is a stub
 (Pear Desktop / Chromium MediaSession), volume falls back to that player's
 PipeWire/Pulse sink-input — still per-app, never the default sink.
 
-Player selection prefers actually playing (status Playing and MPRIS position
-advancing), then stale Playing, then Paused, then Stopped. Within a tier:
-writable-known > non-chromium > list order. Volume writability is tracked
-per player so a Chromium MediaSession stub failure does not block others.
-Every playerctl command pins `-p <player>`.
+Player selection prefers an explicit GUI selection, then a persisted preferred
+player, then actually playing (status Playing and MPRIS position advancing),
+then stale Playing, Paused, and Stopped. Within a tier: writable-known >
+non-chromium > list order. Every playerctl command pins `-p <player>`.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import shutil
 import subprocess
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 from triki_controller.output.app_stream_volume import AppStreamVolume
 
 VOLUME_STEP = 0.05
 _DEFAULT_RESTORE = 0.5
-# Steady IMU samples must not re-list MPRIS every frame. That scan runs on the
-# BLE thread and delays play/pause. Auto-select still runs on this interval.
 _VOLUME_RESCAN_S = 0.45
 _VOLUME_PULSES = frozenset({"volume_up", "volume_down", "mute", "cycle_player"})
 _TRANSPORT_PULSES = {
@@ -38,6 +38,8 @@ _VOLUME_EPSILON = 0.008
 _VOLUME_VERIFY_TOLERANCE = 0.05
 _STALE_POSITION_S = 0.05
 _STATUS_RANK = {"Playing": 0, "Paused": 1, "Stopped": 2}
+_MEDIA_PREF_FILENAME = "media-player.json"
+_SELECTED_PLAYER: str | None = None
 
 RunFn = Callable[[list[str], float], subprocess.CompletedProcess[str]]
 
@@ -50,6 +52,25 @@ def _default_run(argv: list[str], timeout: float) -> subprocess.CompletedProcess
         text=True,
         timeout=timeout,
     )
+
+
+def _preferred_player_path() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "triki-controller" / _MEDIA_PREF_FILENAME
+
+
+def _load_preferred_player() -> str | None:
+    try:
+        data = json.loads(_preferred_player_path().read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get("default_player")
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
 
 
 @dataclass(frozen=True)
@@ -102,6 +123,34 @@ class MprisPlayerVolume:
 
     def handles_transport(self, pulse: str) -> bool:
         return pulse in _TRANSPORT_PULSES
+
+    def select_player(self, player: str) -> str | None:
+        """Select one discovered player for all MPRIS controllers in this process."""
+        global _SELECTED_PLAYER
+        if self._dry_run:
+            _SELECTED_PLAYER = player
+            self._pinned_player = player
+            self._cached_player = player
+            self.last_error = None
+            return None
+        binary = self._resolve_playerctl()
+        if binary is None:
+            self.last_error = "mpris: brak playerctl — nie można wybrać odtwarzacza"
+            return self.last_error
+        players = self._list_players(binary)
+        if player not in players:
+            self.last_error = f"mpris: odtwarzacz {player!r} nie jest już dostępny"
+            return self.last_error
+        _SELECTED_PLAYER = player
+        self._pinned_player = player
+        self._cached_player = player
+        self._last_set = None
+        self._last_applied_player = None
+        self._read_identity(binary, player)
+        self._volume_scan_mono = 0.0
+        self.log.append(f"mpris select_player -> {player}")
+        self.last_error = None
+        return None
 
     def read_volume(self) -> float | None:
         """Current player volume in [0, 1], or None if unavailable / dry-run."""
@@ -188,7 +237,7 @@ class MprisPlayerVolume:
             )
         elif writable is False:
             detail = self._volume_unwritable_message(label)
-        elif self._pinned_player == active:
+        elif self._pinned_player == active or _SELECTED_PLAYER == active:
             if volume is None:
                 detail = (
                     f"mpris: przypięty {label} — potrząśnij całym urządzeniem Triki, "
@@ -341,7 +390,8 @@ class MprisPlayerVolume:
         return shutil.which("playerctl")
 
     def cycle_player(self) -> str | None:
-        """Shake gesture: pin the next MPRIS player so auto-select cannot steal it."""
+        """Shake gesture: select the next MPRIS player process-wide."""
+        global _SELECTED_PLAYER
         if self._dry_run:
             self.log.append("mpris dry-run cycle_player")
             self.last_error = None
@@ -353,13 +403,18 @@ class MprisPlayerVolume:
         players = self._list_players(binary)
         if not players:
             self._pinned_player = None
+            _SELECTED_PLAYER = None
             self.last_error = "mpris: brak odtwarzacza do przełączenia"
             return self.last_error
-        current = self._pinned_player if self._pinned_player in players else self._select_player(
-            binary, players
-        )
+        if _SELECTED_PLAYER in players:
+            current = _SELECTED_PLAYER
+        elif self._pinned_player in players:
+            current = self._pinned_player
+        else:
+            current = self._select_player(binary, players)
         index = players.index(current) if current in players else -1
         chosen = players[(index + 1) % len(players)]
+        _SELECTED_PLAYER = chosen
         self._pinned_player = chosen
         self._cached_player = chosen
         self._last_set = None
@@ -378,18 +433,30 @@ class MprisPlayerVolume:
     def _select_player(
         self, binary: str, players: tuple[str, ...] | None = None
     ) -> str | None:
-        """Pick active player. A shake-pin wins until the player disappears."""
+        """Pick active player: explicit GUI choice, pin, preferred, then auto rank."""
+        global _SELECTED_PLAYER
         self._volume_scan_mono = time.monotonic()
         listed = players if players is not None else self._list_players(binary)
         if not listed:
             self._cached_player = None
             self._pinned_player = None
+            _SELECTED_PLAYER = None
             return None
+        if _SELECTED_PLAYER is not None and _SELECTED_PLAYER not in listed:
+            _SELECTED_PLAYER = None
+        if _SELECTED_PLAYER is not None:
+            self._pinned_player = _SELECTED_PLAYER
+            self._cached_player = _SELECTED_PLAYER
+            return _SELECTED_PLAYER
         if self._pinned_player is not None and self._pinned_player not in listed:
             self._pinned_player = None
         if self._pinned_player is not None:
             self._cached_player = self._pinned_player
             return self._pinned_player
+        preferred = _load_preferred_player()
+        if preferred in listed:
+            self._cached_player = preferred
+            return preferred
         ranked: list[tuple[tuple[int, int, int, int], str]] = []
         for index, player in enumerate(listed):
             status = self._read_status(binary, player)
@@ -552,7 +619,6 @@ class MprisPlayerVolume:
     def _verify_volume(self, binary: str, player: str, expected: float) -> str | None:
         actual = self._read_volume(binary, player)
         if actual is None:
-            # Some players omit Volume reads after set; don't hard-fail.
             return None
         if abs(actual - expected) <= _VOLUME_VERIFY_TOLERANCE:
             self._mark_writable(player)
@@ -658,7 +724,6 @@ class MprisPlayerVolume:
             return None
         if result.returncode != 0:
             return None
-        # busctl prints: s "com.github.th-ch.youtube-music"
         text = (result.stdout or "").strip()
         if text.startswith("s "):
             text = text[2:].strip()
