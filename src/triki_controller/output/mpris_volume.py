@@ -15,7 +15,9 @@ Every playerctl command pins `-p <player>`.
 
 from __future__ import annotations
 
+import json
 import shutil
+from triki_controller.gui.media_favorite import selector_favorite, unique_favorite_target
 import subprocess
 import time
 from dataclasses import dataclass
@@ -100,6 +102,7 @@ class MprisPlayerVolume:
         self._manual_baseline = self._manual_origin = self._baseline_update = None
         self._manual_rebase = False
         self._translation_player = None
+        self._favorite_generation = None
 
     def list_media_players(self) -> list[tuple[str, str]]:
         binary = self._resolve_playerctl()
@@ -108,7 +111,76 @@ class MprisPlayerVolume:
         # Listing is observational: do not use _read_identity (it changes caches).
         return [(name, self._friendly_name(name, None)) for name in self._list_players(binary)]
 
+    def _desktop_entry(self, player: str) -> str | None:
+        busctl = shutil.which("busctl")
+        if busctl is None:
+            return None
+        try:
+            result = self._run([busctl, "--user", "get-property",
+                                player if player.startswith(":") else f"org.mpris.MediaPlayer2.{player}",
+                                "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2", "DesktopEntry"], 1.5)
+            text = (result.stdout or "").strip()
+            value = json.loads(text[2:]) if result.returncode == 0 and text.startswith("s ") else None
+            return value if isinstance(value, str) and value.strip() else None
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return None
+
+    def _bus_owner(self, player: str) -> str | None:
+        busctl = shutil.which("busctl")
+        if busctl is None:
+            return None
+        try:
+            result = self._run([busctl, "--user", "call", "org.freedesktop.DBus",
+                                "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                                "GetNameOwner", "s", f"org.mpris.MediaPlayer2.{player}"], 1.5)
+            text = (result.stdout or "").strip()
+            value = json.loads(text[2:]) if result.returncode == 0 and text.startswith("s ") else None
+            return value if isinstance(value, str) and value.startswith(":") else None
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return None
+
+    def favorite_media_descriptors(self, player_ids=None) -> dict[str, dict[str, str]]:
+        """Detached observational snapshot; never reuse it to authorize a star/write.
+
+        The picker supplies its already listed names. Capture every owner before
+        reading metadata from unique destinations, then recheck all aliases.
+        """
+        if player_ids is None:
+            binary = self._resolve_playerctl()
+            player_ids = self._list_players(binary) if binary else ()
+        players = tuple(dict.fromkeys(player_ids))
+        owners = {p: self._bus_owner(p) for p in players}
+        entries = {p: self._desktop_entry(owner) if owner else None
+                   for p, owner in owners.items()}
+        stable = {p: bool(owner and self._bus_owner(p) == owner)
+                  for p, owner in owners.items()}
+        counts = {}
+        for app in entries.values():
+            if app:
+                counts[app] = counts.get(app, 0) + 1
+        return {p: {"platform": "mpris", "app_id": app, "label": p}
+                for p, app in entries.items()
+                if app and stable[p] and counts[app] == 1}
+
+    def favorite_media_descriptor(self, player_id: str) -> dict[str, str]:
+        binary = self._resolve_playerctl()
+        players = self._list_players(binary) if binary else ()
+        if player_id not in players:
+            raise ValueError("Selected player unavailable")
+        owners = {p: self._bus_owner(p) for p in players}
+        entries = [(p, self._desktop_entry(owner) if owner else None)
+                   for p, owner in owners.items()]
+        app_id = next(app for p, app in entries if p == player_id)
+        if owners[player_id] is None or self._bus_owner(player_id) != owners[player_id]:
+            raise ValueError("Selected player owner changed; cannot favorite stale metadata")
+        if not app_id:
+            raise ValueError("Stable MPRIS DesktopEntry unavailable; cannot favorite guessed labels or instance suffixes")
+        descriptor = {"platform": "mpris", "app_id": app_id, "label": player_id}
+        unique_favorite_target(descriptor, entries)
+        return descriptor
+
     def select_media_player(self, player_id: str | None) -> None:
+        self._invalidate_favorite_generation()
         self._manual_player = player_id
         self._manual_rebase = True
         self._manual_baseline = self._manual_origin = self._baseline_update = None
@@ -118,6 +190,22 @@ class MprisPlayerVolume:
         self._saved_volume = None
         self._muted = False
         self._volume_scan_mono = 0.0
+
+    def _invalidate_favorite_generation(self):
+        """Forget instance-owned state without changing the stored selection."""
+        if self._favorite_generation is not None:
+            player = self._favorite_generation[0]
+            self._writable_players.discard(player)
+            self._unwritable_players.discard(player)
+            self._stream_players.discard(player)
+            self._last_position.pop(player, None)
+        self._favorite_generation = None
+        self._saved_volume = None
+        self._muted = False
+        self._cached_identity = None
+        self._translation_player = None
+        self._manual_rebase = True
+        self.reset_player()
 
     def reset_player(self):
         # Legacy automatic mode remains direct; explicit picker translations
@@ -156,7 +244,7 @@ class MprisPlayerVolume:
         if player is None:
             return None
         if player in self._stream_players or self._looks_like_chromium_stub(player, None):
-            stream_vol = self._stream.read_level(player)
+            stream_vol = self._stream.read_level(self._stream_target(player))
             if stream_vol is not None:
                 return stream_vol
         return self._read_volume(binary, player)
@@ -213,7 +301,7 @@ class MprisPlayerVolume:
         stream_volume = None
         stub = self._looks_like_chromium_stub(active, identity)
         if active in self._stream_players or stub:
-            stream_volume = self._stream.read_level(active)
+            stream_volume = self._stream.read_level(self._stream_target(active))
             if stub:
                 volume = stream_volume
         self._cached_player = active
@@ -442,6 +530,8 @@ class MprisPlayerVolume:
         """Reuse the last player until the rescan interval elapses."""
         if self._manual_player is not None:
             return self._select_player(binary)
+        if selector_favorite(self._manual_player, "mpris") is not None:
+            return self._select_player(binary)
         if (time.monotonic() - self._volume_scan_mono) < _VOLUME_RESCAN_S:
             return self._pinned_player or self._cached_player
         return self._select_player(binary)
@@ -453,14 +543,39 @@ class MprisPlayerVolume:
         self._volume_scan_mono = time.monotonic()
         listed = players if players is not None else self._list_players(binary)
         if self._manual_player is not None:
-            if self._manual_player not in listed:
+            favorite = selector_favorite(self._manual_player, "mpris")
+            target = self._manual_player
+            if favorite is not None:
+                try:
+                    owners = {p: self._bus_owner(p) for p in listed}
+                    entries = [(p, self._desktop_entry(owner) if owner else None)
+                               for p, owner in owners.items()]
+                    target = unique_favorite_target(favorite, entries)
+                    owner = owners[target]
+                    if owner is None or self._bus_owner(target) != owner:
+                        raise ValueError("favorite player bus owner changed or unavailable; refusing stale target")
+                    generation = (target, owner)
+                    if generation != self._favorite_generation:
+                        self._invalidate_favorite_generation()
+                        self._writable_players.discard(target)
+                        self._unwritable_players.discard(target)
+                        self._stream_players.discard(target)
+                        self._favorite_generation = generation
+                except ValueError as exc:
+                    self._cached_player = None
+                    self._invalidate_favorite_generation()
+                    self.last_error = f"mpris: {exc}"
+                    return None
+            if target not in listed:
                 self._cached_player = None
                 self._manual_rebase = True
                 self._manual_baseline = self._manual_origin = self._baseline_update = None
                 self.last_error = f"mpris: selected player unavailable: {self._manual_player}; no substitution"
                 return None
-            self._cached_player = self._manual_player
-            return self._manual_player
+            if target != self._cached_player:
+                self.reset_player()
+            self._cached_player = target
+            return target
         if not listed:
             self._cached_player = None
             self._pinned_player = None
@@ -520,8 +635,17 @@ class MprisPlayerVolume:
             return True
         return self._looks_like_chromium_stub(player, self._cached_identity)
 
+    def _stream_target(self, player: str) -> str:
+        if selector_favorite(self._manual_player, "mpris") is not None:
+            # PipeWire fallback identifies the captured owner PID/tree, never a
+            # newly inherited well-known name or a fuzzy application label.
+            if self._favorite_generation is not None and self._favorite_generation[0] == player:
+                return self._favorite_generation[1]
+            raise ValueError("favorite stream owner unavailable; no substitution")
+        return player
+
     def _apply_stream_level(self, player: str, target: float) -> str | None:
-        err = self._stream.apply_level(player, target)
+        err = self._stream.apply_level(self._stream_target(player), target)
         if err:
             if "brak strumienia" in err:
                 self.log.append(f"mpris stream pending player={player} target={target:.3f}")
@@ -543,7 +667,7 @@ class MprisPlayerVolume:
 
     def _nudge(self, binary: str, player: str, delta: float) -> str | None:
         if self._should_use_stream(player):
-            current = self._stream.read_level(player)
+            current = self._stream.read_level(self._stream_target(player))
             if current is None:
                 current = self._last_set if self._last_set is not None else 0.5
             return self._apply_stream_level(player, max(0.0, min(1.0, current + delta)))
@@ -580,7 +704,7 @@ class MprisPlayerVolume:
 
     def _toggle_mute(self, binary: str, player: str) -> str | None:
         if self._should_use_stream(player):
-            current = self._stream.read_level(player)
+            current = self._stream.read_level(self._stream_target(player))
             if self._muted or (current is not None and current <= 0.001):
                 restore = self._saved_volume if self._saved_volume is not None else _DEFAULT_RESTORE
                 err = self._apply_stream_level(player, restore)
@@ -647,6 +771,21 @@ class MprisPlayerVolume:
         return self.last_error
 
     def _read_volume(self, binary: str, player: str) -> float | None:
+        if selector_favorite(self._manual_player, "mpris") is not None:
+            busctl = shutil.which("busctl")
+            generation = self._favorite_generation
+            if busctl is None or generation is None or generation[0] != player:
+                return None
+            try:
+                result = self._run([busctl, "--user", "get-property", generation[1],
+                                    "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player",
+                                    "Volume"], 1.5)
+                text = (result.stdout or "").strip()
+                if result.returncode != 0 or not text.startswith("d "):
+                    return None
+                return max(0.0, min(1.0, float(text[2:])))
+            except (OSError, subprocess.TimeoutExpired, ValueError):
+                return None
         try:
             result = self._run([binary, "-p", player, "volume"], 1.5)
         except (OSError, subprocess.TimeoutExpired):
@@ -695,6 +834,11 @@ class MprisPlayerVolume:
     def _read_identity(self, binary: str, player: str) -> str | None:
         """Best-effort identity. playerctl has no Identity getter; use clues."""
         self._cached_player = player
+        if selector_favorite(self._manual_player, "mpris") is not None:
+            generation = self._favorite_generation
+            identity = self._bus_identity(generation[1]) if generation and generation[0] == player else None
+            self._cached_identity = identity
+            return identity
         identity: str | None = None
         player_l = player.lower()
         if "youtube" in player_l or "peardesktop" in player_l:
@@ -720,7 +864,7 @@ class MprisPlayerVolume:
         busctl = shutil.which("busctl")
         if busctl is None:
             return None
-        bus_name = f"org.mpris.MediaPlayer2.{player}"
+        bus_name = player if player.startswith(":") else f"org.mpris.MediaPlayer2.{player}"
         try:
             result = self._run(
                 [
@@ -747,8 +891,27 @@ class MprisPlayerVolume:
         return text or None
 
     def _exec(self, binary: str, player: str, args: list[str]) -> str | None:
+        argv = [binary, "-p", player, *args]
+        if selector_favorite(self._manual_player, "mpris") is not None:
+            owner = self._bus_owner(player)
+            if owner is None or self._favorite_generation != (player, owner):
+                self._invalidate_favorite_generation()
+                return "mpris: favorite player identity changed before write; rebase required"
+            busctl = shutil.which("busctl")
+            if busctl is None:
+                return "mpris: favorite targeted control unavailable; no substitution"
+            # Unique D-Bus destination cannot be inherited by a restarted app.
+            argv = [busctl, "--user", "call", owner, "/org/mpris/MediaPlayer2"]
+            if len(args) == 2 and args[0] == "volume":
+                argv += ["org.freedesktop.DBus.Properties", "Set", "ssv",
+                         "org.mpris.MediaPlayer2.Player", "Volume", "d", args[1]]
+            elif len(args) == 1 and args[0] in {"play-pause", "next", "previous"}:
+                method = {"play-pause": "PlayPause", "next": "Next", "previous": "Previous"}[args[0]]
+                argv += ["org.mpris.MediaPlayer2.Player", method]
+            else:
+                return "mpris: unsupported favorite command; no substitution"
         try:
-            result = self._run([binary, "-p", player, *args], 1.5)
+            result = self._run(argv, 1.5)
         except subprocess.TimeoutExpired:
             return "mpris: playerctl timeout"
         except OSError as exc:

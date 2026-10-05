@@ -165,7 +165,7 @@ class AppStreamVolume:
         busctl = self._busctl or shutil.which("busctl")
         if busctl is None:
             return None
-        bus_name = f"org.mpris.MediaPlayer2.{player}"
+        bus_name = player if player.startswith(":") else f"org.mpris.MediaPlayer2.{player}"
         try:
             result = self._run(
                 [

@@ -21,6 +21,8 @@ GLYPHS = {
     "menu": 0xE2C2,
     "close": 0xE4F6,
     "launch": 0xE06C,
+    "star": 0xE46A,
+    "save": 0xE248,
 }
 
 

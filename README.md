@@ -2,7 +2,7 @@
 
 Triki Controller łączy nakładkę Triki CAP001 przez Bluetooth Low Energy (BLE) i zamienia jej ruch na **Kierownicę**, **AirMouse**, **Joystick** albo **Multimedia**. Interfejs to aplikacja desktopowa Tkinter/CustomTkinter, nie strona WWW. CLI służy także do diagnostyki i zapisu surowych próbek.
 
-> **Zakres tej instrukcji:** bieżący kod źródłowy i pakiety zbudowane z niego, w tym opcje przygotowywane do wydania v0.1.2. Starsze archiwa, np. v0.1.1, mogą nie mieć opisanych nowych funkcji. Aktualizacja README nie oznacza, że funkcje przeszły QA na fizycznej nakładce lub na wszystkich systemach.
+> **Zakres tej instrukcji:** bieżący kod dla wydania v0.1.3 i pakiety zbudowane z niego. Starsze archiwa, np. v0.1.2, nie mają ulubionego celu startowego i nowych kontrolek zmiany funkcji. Aktualizacja README nie oznacza, że funkcje przeszły QA na fizycznej nakładce lub na wszystkich systemach.
 >
 > Obsługa CAP001 nadal używa parsera `reference-hypothesis` opartego na TrikiScope. Format ramek i przeliczniki 2048 LSB/g oraz 131 LSB/(°/s) nie są pełną akceptacją protokołu HOM-27. Syntetyczne testy i podgląd nie zastępują pomiarów sprzętowych.
 
@@ -13,6 +13,7 @@ Triki Controller łączy nakładkę Triki CAP001 przez Bluetooth Low Energy (BLE
 - [Pierwsze połączenie i bezpieczny start](#pierwsze-połączenie-i-bezpieczny-start)
 - [Menu główne i ekran urządzenia](#menu-główne-i-ekran-urządzenia)
 - [Cztery tryby sterowania](#cztery-tryby-sterowania)
+- [Ulubiony odtwarzacz startowy](#ulubiony-odtwarzacz-startowy)
 - [Własne przypisania przycisku i kierunków](#własne-przypisania-przycisku-i-kierunków)
 - [Konfigurator krok po kroku](#konfigurator-krok-po-kroku)
 - [Zapis ustawień](#zapis-ustawień)
@@ -81,7 +82,7 @@ py -3 -m venv .venv
 
 Ten plik zawiera także PyInstaller (potrzebny do budowania, nie do zwykłego uruchomienia). Zależności natywne są wybierane znacznikami systemu: Windows — `pycaw`, `comtypes`, `psutil`; macOS — PyObjC Cocoa, ScriptingBridge i Quartz. Zainstaluj je na docelowym systemie, nie na Linuksie w celu „udawania” Windows/macOS.
 
-Na Linuksie potrzebny jest również systemowy Tk: np. `python3-tk` na Debian/Ubuntu albo `tk` na Arch/CachyOS. BLE wymaga działającego Bluetooth/BlueZ i D-Bus. Narzędzia `playerctl` oraz `pactl` do audio nie są dostarczane przez pip.
+Na Linuksie potrzebny jest również systemowy Tk: np. `python3-tk` na Debian/Ubuntu albo `tk` na Arch/CachyOS. BLE wymaga działającego Bluetooth/BlueZ i D-Bus. Narzędzia `playerctl` oraz `pactl` do audio nie są dostarczane przez pip. Ulubiony cel startowy MPRIS dodatkowo wymaga `busctl` (narzędzie systemd), dostępnej magistrali sesji D-Bus i poprawnego `DesktopEntry` odtwarzacza. Brak tych zależności daje komunikat i blokuje zastępcze sterowanie innym celem.
 
 Alternatywnie instaluj tylko wybrane extras:
 
@@ -132,6 +133,8 @@ W dalszych przykładach `triki-controller` oznacza polecenie z zainstalowanego �
 
 Po utracie połączenia wyjście jest zatrzymywane. **Połącz ponownie** ponawia skanowanie; ponownie obudź Triki jednym naciśnięciem. Szybkie tryby mogą po nowym strumieniu ponownie uzbroić wyjście. W konfiguratorze sprawdź stan i wybierz tryb wyjścia jawnie. Po zatrzymaniu szybki ekran nie ma osobnego przycisku Start: użyj **Połącz ponownie** albo wróć do menu i uruchom profil.
 
+**Zmiana funkcji nie wymaga ponownego połączenia.** Na ekranie urządzenia użyj listy **Funkcja** albo wróć do **Menu** i uruchom inny profil. Istniejąca sesja BLE i strumień pozostają te same; aplikacja zwalnia stare wejścia i przełącza mapowanie/wyjście. Podczas trwającego skanowania lub łączenia nowa funkcja użyje już rozpoczętej próby, bez drugiego połączenia. Błąd przełączenia zatrzymuje wyjście i zgłasza problem — nie wymusza rozłączenia BLE. **Połącz ponownie** jest naprawą połączenia, nie standardowym sposobem zmiany funkcji.
+
 Normalne zatrzymanie, zmiana profilu, rozłączenie i zamknięcie zwalniają przytrzymywane wejścia oraz neutralizują osie. Błędy czyszczenia są zgłaszane. Nie jest to gwarancja zwolnienia wejścia po wymuszonym ubiciu procesu lub awarii systemu. Zatrzymanie nie służy do przywracania wcześniejszej głośności systemu.
 
 ## Menu główne i ekran urządzenia
@@ -150,6 +153,7 @@ Normalne zatrzymanie, zmiana profilu, rozłączenie i zamknięcie zwalniają prz
 ### Ekran wybranego urządzenia
 
 - **Stan urządzenia:** połączenie BLE, tryb sterowania, przycisk, bateria/RSSI (jeżeli dostępne), liczba próbek i szczegóły błędu. **Hz** to częstotliwość otrzymywanych próbek, nie liczba FPS gry.
+- **Funkcja:** przełącza Kierownicę, AirMouse, Joystick i Multimedia bez rozłączania urządzenia. W menu także widać stan zachowanego połączenia.
 - **Wartości profilu:** kierownica w stopniach i pedały w %, prędkość kursora w px/s, wychylenie joysticka X/Y albo głośność z mapowania. To podgląd obliczeń, nie potwierdzenie reakcji zewnętrznej aplikacji.
 - **Opcje sterowania:** własne przypisania dla Kierownicy/AirMouse/Joysticka; dla Multimediów — wybór odtwarzacza i przełącznik potrząśnięcia. Sekcja jest przewijana.
 - **Zapisz:** utrwala aktualne ustawienia; sama zmiana listy lub przełącznika działa w sesji, bez zapisu pliku.
@@ -159,7 +163,7 @@ Normalne zatrzymanie, zmiana profilu, rozłączenie i zamknięcie zwalniają prz
 | **Połącz ponownie** | Rozłącza trwającą sesję, jeżeli trzeba, i uruchamia nowy skan BLE. |
 | **Zatrzymaj sterowanie** | Zatrzymuje i neutralizuje wyjście; zostawia połączenie BLE. |
 | **Rozłącz** | Kończy BLE i wyjście. |
-| **Menu** | Na ekranie otwartym z menu zatrzymuje sterowanie, rozłącza i wraca do menu głównego. |
+| **Menu** | Pyta o niezapisane zmiany, zatrzymuje sterowanie i wraca do menu głównego, **zachowując BLE**. Uruchomienie innej funkcji wykorzysta to połączenie. Anulowanie pytania pozostawia bieżący ekran i sterowanie bez zmian. |
 | **Zamknij** | Kończy aplikację, z pytaniem o niezapisane zmiany. |
 
 Przyciski menu/ekranu urządzenia można wybierać Tab i uruchamiać Enter/Spacją. Nowe listy w **Opcje sterowania** reagują także na strzałki. Nie są to globalne skróty do gry — działają na kontrolkach aplikacji mających fokus.
@@ -229,10 +233,23 @@ Lista przechowuje identyfikator backendu, nie tylko nazwę widoczną na ekranie.
 
 Do zmiany celu potrząśnięciem używaj trybu **Automatycznie**. **Wybór ręczny blokuje zmianę gestem**: przełącznik potrząśnięcia jest wtedy nieaktywny, a GUI wyświetla wyjaśnienie. Po powrocie do **Automatycznie** wraca wcześniej ustawiona wartość przełącznika; nadal możesz wyłączyć gest. Automatyczny wybór zależy od backendu, nie od tego, którą kartę WWW aktualnie oglądasz.
 
+#### Ulubiony odtwarzacz startowy
+
+1. Uruchom aplikację multimedialną i wybierz ją na liście **Odtwarzacz (wybór ręczny)**.
+2. Kliknij przycisk z **gwiazdką**. Stan **Ulubiony** oraz opis **Start: …** oznaczają wybrany cel startowy.
+3. Kliknij **Zapisz**. Dopiero zapis utrwala gwiazdkę na kolejne uruchomienie Triki Controller; sama gwiazdka jest zmianą roboczą.
+4. Po ponownym uruchomieniu Triki Controller zapisany ulubiony ma pierwszeństwo przed wcześniejszym ręcznym wyborem/Automatycznie.
+
+W jednej konfiguracji jest **jeden ulubiony**. Wybranie gwiazdki przy innej aplikacji zastępuje poprzednią preferencję. **Usuń ulubiony** usuwa gwiazdkę także wtedy, gdy program nie jest aktualnie dostępny; zapisz tę zmianę, aby utrwalić usunięcie. Trybu **Automatycznie** nie można oznaczyć gwiazdką.
+
+Ulubiony rozpoznawany jest po trwałej tożsamości aplikacji: ścieżce pliku wykonywalnego na Windows, identyfikatorze bundle na macOS lub `DesktopEntry` MPRIS na Linuxie — nie tylko po PID albo nazwie wyświetlanej. Brak takiej tożsamości daje komunikat zamiast zgadywania. Brak programu lub kilka pasujących instancji nie powodują sterowania innym odtwarzaczem; aplikacja zachowuje preferencję i ponawia rozpoznanie, gdy cel stanie się dostępny. Gwiazdka nie uruchamia samego programu multimedialnego.
+
+Podczas bieżącej sesji możesz jawnie wybrać inny odtwarzacz albo **Automatycznie**, nie usuwając ulubionego. To nadpisanie działa do następnego uruchomienia Triki Controller. Sama zmiana gwiazdki nie przełącza bieżącego celu ani nie włącza Live. Priorytet startowy blokuje zmianę potrząśnięciem do czasu jawnego wyboru innego trybu/celu.
+
 #### Różnice audio między systemami
 
 - **Linux:** transport odtwarzania preferuje MPRIS i może używać globalnych klawiszy uinput jako rezerwy. Brak ręcznie wybranego odtwarzacza nie uruchamia zastępczego sterowania innym celem. Głośność wymaga zapisywalnego MPRIS albo obsługi strumienia **tej samej aplikacji** w adapterze; brak odpowiedniego celu jest zgłaszany, bez zmiany głośności innego programu. Dla Pear Desktop komunikaty wskazują włączenie **Plugins → Shortcuts (& MPRIS)**. Odwrócona nakładka używa osobnego adaptera `pactl` dla domyślnego wyjścia systemowego.
-- **Windows:** głośność/wyciszenie wybranego procesu korzystają z Core Audio. Play/pause/next/previous są **globalnymi klawiszami multimedialnymi Windows**; ich odbiorca nie musi być tym samym procesem co ręcznie wybrana sesja głośności.
+- **Windows:** głośność/wyciszenie wybranego procesu korzystają z Core Audio. W zwykłym trybie play/pause/next/previous są **globalnymi klawiszami multimedialnymi Windows**; ich odbiorca nie musi być tym samym procesem co ręcznie wybrana sesja głośności. Przy aktywnym priorytecie ulubionego globalny transport jest celowo blokowany: backend nie potrafi adresować tych komend do konkretnej aplikacji. Gwiazdka nie dodaje tej obsługi; głośność pozostaje adresowana do ulubionej aplikacji.
 - **macOS:** sterowanie odtwarzaczem dotyczy uruchomionych Music/Spotify i wymaga Automation. Nie obiecuje obsługi innych aplikacji ani kart przeglądarki. Systemowe urządzenie o stałej głośności może odmówić regulacji.
 
 ## Własne przypisania przycisku i kierunków
@@ -317,7 +334,7 @@ triki-controller gui --settings ./moje-ustawienia.json
 - Zmiana osi, suwaka, przypisania, przełącznika lub ręcznego celu działa **natychmiast w sesji**, lecz plik jest utrwalany wyłącznie przez **Zapisz**.
 - Sam wybór szybkiego profilu, odświeżenie odtwarzaczy, połączenie, Stop czy stworzenie skrótu nie zapisują konfiguracji.
 - Zamknięcie / powrót do menu z niezapisanymi zmianami pyta o potwierdzenie. Nie traktuj tego pytania jako automatycznego zapisania ani cofnięcia zmian już zastosowanych w sesji.
-- Zapisywane są profil, orientacja, odwrócenia, mapy osi/progi, przypisania, włączenie potrząśnięcia i identyfikator ręcznego odtwarzacza. **Połączenie i stan Live nie są zapisywane.** Szybkie komendy uruchamiają Live z własnej logiki, nie z pliku.
+- Zapisywane są profil, orientacja, odwrócenia, mapy osi/progi, przypisania, włączenie potrząśnięcia, identyfikator ręcznego odtwarzacza i trwała tożsamość ulubionego celu startowego. **Połączenie i stan Live nie są zapisywane.** Szybkie komendy uruchamiają Live z własnej logiki, nie z pliku.
 - Starsze poprawne ustawienia są nakładką na domyślne wartości; dawne źródła `gyro_*` myszy/joysticka są migrowane na pochylenia X/Y. Zachowane niestandardowe wartości mogą różnić się od tabeli domyślnych.
 - Niepoprawny plik w uruchomieniu GUI daje informację o pominięciu i start z domyślnymi wartościami. Zrób kopię przed ręczną edycją; nie nadpisuj bez namysłu pliku, który został pominięty.
 

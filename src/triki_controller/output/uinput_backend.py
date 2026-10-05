@@ -93,6 +93,16 @@ class UInputBackend:
             self._mpris_owned = True
         return self._mpris.list_media_players()
 
+    def favorite_media_descriptors(self, player_ids=None) -> dict[str, dict[str, str]]:
+        if self._mpris is None:
+            self._mpris = MprisPlayerVolume()
+            self._mpris_owned = True
+        return self._mpris.favorite_media_descriptors(player_ids)
+
+    def favorite_media_descriptor(self, player_id: str) -> dict[str, str]:
+        self.list_media_players()  # Lazily construct only the observational adapter.
+        return self._mpris.favorite_media_descriptor(player_id)
+
     def select_media_player(self, player_id: str | None) -> None:
         self._media_player = player_id
         if self._mpris is not None:

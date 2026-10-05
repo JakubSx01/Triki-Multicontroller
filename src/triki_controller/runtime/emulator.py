@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field, replace
 from typing import Mapping
+from triki_controller.gui.media_favorite import favorite_selector
 
 from triki_controller.core.models import (
     SCHEMA_VERSION,
@@ -57,6 +58,7 @@ class EmulatorRuntime:
     media_player: str | None = None
     control_bindings: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
     media_gestures_enabled: bool = True
+    startup_media_favorite: Mapping[str, str] | None = None
 
     def set_control_bindings(self, mapping: Mapping[str, Mapping[str, str]]) -> None:
         candidate = parse_control_bindings(mapping)
@@ -94,7 +96,7 @@ class EmulatorRuntime:
 
     def select_media_player(self, player: str | None) -> None:
         """Pin the next activation, or explicitly re-seed the current live target."""
-        if player == self.media_player:
+        if player == self.media_player and self.startup_media_favorite is None:
             return
         if self._active and self._live:
             select = getattr(self.output, "select_media_player", None)
@@ -111,6 +113,7 @@ class EmulatorRuntime:
                 self._arm_media_baseline()
         else:
             self.media_player = player
+        self.startup_media_favorite = None
 
     @property
     def native_output(self) -> bool:
@@ -196,9 +199,12 @@ class EmulatorRuntime:
 
     def switch_profile(self, profile: Profile) -> None:
         """Neutralize the old device, then open the new profile. Does not touch BLE."""
+        candidate = profile.validated()
+        if not self._active:
+            self.set_profile(candidate)
+            return
         if self.managed_output:
             previous = self.profile
-            candidate = profile.validated()
             self.deactivate("profile change")
             self.profile = candidate
             try:
@@ -464,7 +470,8 @@ class EmulatorRuntime:
             "activation_epoch": self._epoch,
             "device_name": names[self.profile.mode],
             "dry_run": not self._live,
-            "media_player": self.media_player,
+            "media_player": (favorite_selector(self.startup_media_favorite)
+                             if self.startup_media_favorite is not None else self.media_player),
             "control_bindings": dict(self.control_bindings.get(self.profile.mode, {})),
             "binding_only": (self.native_output and self.profile.mode in {"steering", "plane"}
                              and any(action not in {"default", "off"}

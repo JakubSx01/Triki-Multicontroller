@@ -15,6 +15,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
+from triki_controller.gui.media_favorite import selector_favorite, unique_favorite_target
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,7 @@ class PlayerSession:
     active: bool
     volume: float
     muted: bool
+    app_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -92,6 +94,31 @@ class WindowsAudio:
             # sessions() marshals all native enumeration through its COM worker.
             return [(p.key, p.name) for p in sorted(self.adapter.sessions(), key=lambda p: p.key)]
 
+    def favorite_media_descriptors(self, player_ids=None) -> dict[str, dict[str, str]]:
+        """Scalar-only observation; sessions() uses the adapter's COM owner."""
+        players = tuple(self.adapter.sessions())
+        counts = {}
+        for p in players:
+            if p.app_id:
+                counts[p.app_id] = counts.get(p.app_id, 0) + 1
+        wanted = None if player_ids is None else set(player_ids)
+        return {p.key: {"platform": "windows", "app_id": p.app_id, "label": p.name}
+                for p in players if p.app_id and counts[p.app_id] == 1
+                and (wanted is None or p.key in wanted)}
+
+    def favorite_media_descriptor(self, player_id: str) -> dict[str, str]:
+        with self._lock:
+            players = tuple(self.adapter.sessions())
+            matches = [p for p in players if p.key == player_id]
+            if len(matches) != 1:
+                raise ValueError("Selected player unavailable or ambiguous")
+            player = matches[0]
+            if not player.app_id:
+                raise ValueError("Stable executable identity unavailable for this player")
+            descriptor = {"platform": "windows", "app_id": player.app_id, "label": player.name}
+            unique_favorite_target(descriptor, [(p.key, p.app_id) for p in players])
+            return descriptor
+
     def select_media_player(self, player_id: str | None) -> None:
         with self._lock:
             self._manual_player = player_id
@@ -106,7 +133,10 @@ class WindowsAudio:
             self._scan_at = now
         by_key = {p.key: p for p in self._sessions}
         if self._manual_player is not None:
-            selected = by_key.get(self._manual_player)
+            favorite = selector_favorite(self._manual_player, "windows")
+            key = (unique_favorite_target(favorite, [(p.key, p.app_id) for p in self._sessions])
+                   if favorite is not None else self._manual_player)
+            selected = by_key.get(key)
             if selected is None:
                 self._selected = None
                 raise RuntimeError(f'selected player unavailable: {self._manual_player}; no substitution')
@@ -176,6 +206,9 @@ class WindowsAudio:
             if self._manual_player is None:
                 return None
             try:
+                if selector_favorite(self._manual_player, "windows") is not None:
+                    self._select(force=True)
+                    return None
                 available = getattr(self.adapter, 'player_available', None)
                 found = (available(self._manual_player) if available is not None
                          else any(p.key == self._manual_player for p in self.adapter.sessions()))
@@ -422,7 +455,8 @@ class _CoreAudioRuntime:
         for key, name, session in self._sessions():
             volume = session.SimpleAudioVolume
             current = PlayerSession(key, name, session.State == 1,
-                                    float(volume.GetMasterVolume()), bool(volume.GetMute()))
+                                    float(volume.GetMasterVolume()), bool(volume.GetMute()),
+                                    self._app_identity(session))
             previous = groups.get(key)
             # Prefer an active session's baseline; unify all process sessions on
             # write, and treat the process muted only when all sessions are mute.
@@ -431,8 +465,16 @@ class _CoreAudioRuntime:
             else:
                 preferred = current if current.active and not previous.active else previous
                 groups[key] = PlayerSession(key, name, previous.active or current.active,
-                                            preferred.volume, previous.muted and current.muted)
+                                            preferred.volume, previous.muted and current.muted, preferred.app_id)
         return tuple(groups.values())
+
+    @staticmethod
+    def _app_identity(session):
+        try:
+            # Native process path, not PID/start time or a guessed display name.
+            return session.Process.exe() or None
+        except Exception:
+            return None
 
     def player_available(self, key):
         # Identity-only enumeration: unreadable/muted volume is not absence.

@@ -34,6 +34,7 @@ from triki_controller.gui.settings import (
     THRESHOLD_FIELDS,
     GuiSettings,
 )
+from triki_controller.gui.media_favorite import parse_media_favorite
 from triki_controller.motion.orientation import parse_orientation
 from triki_controller.profiles.devices import (
     MEDIA_ORIENTATION,
@@ -132,6 +133,7 @@ class ControllerSession:
         self._lock = threading.RLock()
         self._output_factory = output_factory
         self._media_catalog: object | None = None
+        self._media_favorite = parse_media_favorite(settings.media_favorite)
         self._scan_timeout = ble_scan_timeout_s
         self._profile_name = settings.profile
         self._orientation = parse_orientation(settings.orientation)
@@ -152,6 +154,7 @@ class ControllerSession:
             control_bindings=settings.control_bindings,
             media_gestures_enabled=settings.media_gestures_enabled,
             media_player=settings.media_player,
+            startup_media_favorite=(dict(self._media_favorite) if self._media_favorite else None),
         )
         self._runtime.mapper.set_axis_map(self._axis_map)
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -215,29 +218,14 @@ class ControllerSession:
         with self._lock:
             if name == self._profile_name:
                 return None
-            try:
-                profile = self._build_profile(name)
-            except ValueError as exc:
-                return f"Nieprawidłowy profil: {exc}"
-            if self._runtime.managed_output:
-                # Clean the old mapper/backend before changing mount or UI metadata.
-                error = self._apply_profile_locked(profile)
-                if error is not None:
-                    return error
-            self._profile_name = name
-            self._pulses.clear()
-            self._pointer.clear()
-            # Locked mounts: media/mouse=horizontal, steering=vertical.
-            if name == "media" and self._orientation != MEDIA_ORIENTATION:
-                self._orientation = MEDIA_ORIENTATION
-                self._runtime.set_orientation(MEDIA_ORIENTATION)
-            elif name == "steering" and self._orientation != STEERING_ORIENTATION:
-                self._orientation = STEERING_ORIENTATION
-                self._runtime.set_orientation(STEERING_ORIENTATION)
-            elif name in {"mouse", "plane"} and self._orientation != MOUSE_ORIENTATION:
-                self._orientation = MOUSE_ORIENTATION
-                self._runtime.set_orientation(MOUSE_ORIENTATION)
-            return self._apply_profile_locked(profile)
+            # Use the same owned-output transaction as a whole settings edit:
+            # release first, stage profile AND mount offline, open once, roll back
+            # rejected configuration without reconnecting or implicitly rearming.
+            error = self.apply_settings(replace(self.current_settings(), profile=name))
+            if error is None:
+                self._pulses.clear()
+                self._pointer.clear()
+            return error
 
     def set_inversion(self, *, invert_pitch: bool, invert_roll: bool) -> str | None:
         with self._lock:
@@ -354,17 +342,68 @@ class ControllerSession:
                 control_bindings={name: dict(values) for name, values in self._runtime.control_bindings.items()},
                 media_gestures_enabled=self._runtime.media_gestures_enabled,
                 media_player=self._runtime.media_player,
+                media_favorite=(dict(self._media_favorite) if self._media_favorite else None),
             )
 
-    def list_media_players(self) -> list[tuple[str, str]]:
+    def active_media_favorite(self) -> dict[str, str] | None:
+        """Observe startup routing priority, not availability or playback state."""
+        with self._lock:
+            favorite = self._runtime.startup_media_favorite
+            return dict(favorite) if favorite is not None else None
+
+    def _observational_media_catalog(self):
+        """Capture an adapter, not native pointers; observe outside the session lock."""
         with self._lock:
             if hasattr(self._runtime.output, "list_media_players"):
-                return self._runtime.list_media_players()
-            # Construct an observational adapter, never open/activate its input.
+                return self._runtime.output
+            # Construct only; never open/activate its input.
             if self._media_catalog is None:
                 self._media_catalog = self._output_factory(True)
-            enumerate_players = getattr(self._media_catalog, "list_media_players", None)
-            return list(enumerate_players()) if enumerate_players is not None else []
+            return self._media_catalog
+
+    def list_media_players(self) -> list[tuple[str, str]]:
+        catalog = self._observational_media_catalog()
+        enumerate_players = getattr(catalog, "list_media_players", None)
+        return list(enumerate_players()) if enumerate_players is not None else []
+
+    def favorite_media_descriptors(self, player_ids=None) -> dict[str, dict[str, str]]:
+        """Detached picker metadata, not routing authority; ambiguous/missing omitted.
+
+        Native adapters marshal observations on their existing owner thread.
+        Legacy adapters without a batch API are not scanned once per row.
+        """
+        catalog = self._observational_media_catalog()
+        describe = getattr(catalog, "favorite_media_descriptors", None)
+        if describe is None:
+            return {}
+        try:
+            descriptors = describe(None if player_ids is None else tuple(player_ids))
+            result = {}
+            for key, value in descriptors.items():
+                descriptor = parse_media_favorite(value)
+                if descriptor is not None:
+                    result[key] = descriptor
+            return result
+        except Exception as exc:
+            raise ValueError(f"Stable application catalogue discovery failed: {exc}") from exc
+
+    def favorite_media_descriptor(self, player_id: str) -> dict[str, str]:
+        """Fresh unique native identity validation; never select or save it."""
+        if not isinstance(player_id, str) or not player_id.strip():
+            raise ValueError("Choose an available player before favoriting it.")
+        catalog = self._observational_media_catalog()
+        describe = getattr(catalog, "favorite_media_descriptor", None)
+        if describe is None:
+            raise ValueError("Stable application identity is unavailable on this backend.")
+        try:
+            descriptor = parse_media_favorite(describe(player_id))
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"Stable application identity discovery failed: {exc}") from exc
+        if descriptor is None:
+            raise ValueError("Stable application identity is unavailable for this player.")
+        return descriptor
 
     def select_media_player(self, player: str | None) -> str | None:
         with self._lock:
@@ -378,6 +417,7 @@ class ControllerSession:
         with self._lock:
             overrides = {name: dict(settings.thresholds.get(name, {})) for name in PROFILE_NAMES}
             try:
+                favorite = parse_media_favorite(settings.media_favorite)
                 bindings = parse_control_bindings(settings.control_bindings)
                 if not isinstance(settings.media_gestures_enabled, bool):
                     raise ValueError("media_gestures_enabled must be true or false")
@@ -396,16 +436,19 @@ class ControllerSession:
                 return f"Nieprawidłowe ustawienia: {exc}"
             previous = self.current_settings()
             previous_profile = self._runtime.profile
+            previous_startup_favorite = self._runtime.startup_media_favorite
             was_active, was_live = self._runtime.active, self._runtime.live
             reopen = was_active and (settings.profile != self._profile_name
                                      or bindings != self._runtime.control_bindings)
             try:
                 if reopen:
                     # Stage the whole candidate offline, then open exactly once.
-                    self._runtime.deactivate("settings change")
+                    self._runtime.deactivate("profile change" if settings.profile != previous.profile
+                                             else "settings change")
                 self._runtime.set_control_bindings(bindings)
                 self._runtime.set_media_gestures_enabled(settings.media_gestures_enabled)
-                self._runtime.select_media_player(settings.media_player)
+                if settings.media_player != previous.media_player:
+                    self._runtime.select_media_player(settings.media_player)
                 self._overrides = overrides
                 self._axis_map = {name: dict(values) for name, values in settings.axis_map.items()}
                 self._runtime.mapper.set_axis_map(self._axis_map)
@@ -423,6 +466,7 @@ class ControllerSession:
                 self._runtime.set_profile(profile)
                 if reopen:
                     self._runtime.activate(live=was_live)
+                self._media_favorite = favorite
             except Exception as exc:
                 errors = [str(exc)]
                 # Roll back configuration, not activation or resource ownership.
@@ -443,6 +487,7 @@ class ControllerSession:
                 self._runtime.mapper.set_control_bindings(previous.control_bindings)
                 self._runtime.set_media_gestures_enabled(previous.media_gestures_enabled)
                 self._runtime.media_player = previous.media_player
+                self._runtime.startup_media_favorite = previous_startup_favorite
                 self._runtime.profile = previous_profile
                 self._axis_map = previous.axis_map
                 self._runtime.mapper.set_axis_map(self._axis_map)

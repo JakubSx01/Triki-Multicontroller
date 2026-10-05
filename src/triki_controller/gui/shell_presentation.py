@@ -51,9 +51,8 @@ def _surface(parent: Any) -> ctk.CTkFrame:
 
 def _shell_container(app: Any) -> ctk.CTkFrame:
     app._content.configure(fg_color=BG)
-    outer = ctk.CTkFrame(app._content, fg_color=BG, width=640)
-    outer.pack(fill="y", expand=True, padx=24, pady=20)
-    outer.pack_propagate(False)
+    outer = ctk.CTkFrame(app._content, fg_color=BG)
+    outer.pack(fill="both", expand=True, padx=20, pady=16)
     return outer
 
 
@@ -65,8 +64,11 @@ def build_main_menu(app: Any, devices: dict) -> None:
     source = _surface(outer)
     source.pack(fill="x", pady=(0, 12))
     ctk.CTkLabel(source, text="", image=icon("bluetooth", 22, ICON_COLOR), width=32).pack(side="left", padx=(14, 8), pady=14)
-    _label(source, "BLE · naciśnij raz przycisk na nakładce przed połączeniem.",
-           text_color=MUTED, wraplength=430, justify="left", anchor="w").pack(side="left", padx=(0, 12), pady=10)
+    source_copy = ctk.CTkFrame(source, fg_color="transparent")
+    source_copy.pack(side="left", fill="x", expand=True, padx=(0, 12), pady=8)
+    _label(source_copy, textvariable=app._conn, anchor="w").pack(fill="x")
+    _label(source_copy, "Zmiana funkcji zachowuje połączenie BLE.",
+           text_color=MUTED, wraplength=380, justify="left", anchor="w").pack(fill="x")
     cards = ctk.CTkScrollableFrame(outer, fg_color=BG, corner_radius=0)
     cards.pack(fill="both", expand=True)
     app._shell_launch_buttons = {}
@@ -100,24 +102,42 @@ def build_main_menu(app: Any, devices: dict) -> None:
 def build_device_screen(app: Any, title: str, *, from_menu: bool) -> None:
     outer = _shell_container(app)
     header = ctk.CTkFrame(outer, fg_color="transparent")
-    header.pack(fill="x", pady=(0, 16))
+    header.pack(fill="x", pady=(0, 12))
+    heading = ctk.CTkFrame(header, fg_color="transparent")
+    heading.pack(fill="x")
     profile = {"wheel": "steering", "music": "media"}.get(app._quick_command, app._quick_command or "steering")
-    ctk.CTkLabel(header, text="", image=icon(profile, 28, ICON_COLOR), width=36).pack(side="left", padx=(0, 10))
-    _label(header, title, size=23, bold=True).pack(side="left")
-    _label(header, textvariable=app._rate, text_color=MUTED).pack(side="right")
+    ctk.CTkLabel(heading, text="", image=icon(profile, 28, ICON_COLOR), width=36).pack(side="left", padx=(0, 10))
+    _label(heading, title, size=23, bold=True).pack(side="left")
+    _label(heading, textvariable=app._rate, text_color=MUTED).pack(side="right")
+    functions = ctk.CTkFrame(header, fg_color="transparent")
+    functions.pack(fill="x", pady=(8, 0))
+    _label(functions, "Funkcja", text_color=MUTED).pack(side="left", padx=(0, 12))
+    labels = {"Kierownica": "steering", "AirMouse": "mouse", "Joystick": "plane", "Multimedia": "media"}
+    from triki_controller.gui.control_options import _keyboard_menu
+    def choose(label):
+        app._launch_device(labels[label])
+        # Rebuilding the device controls must not strand keyboard focus.
+        tk.Misc.focus_set(app._function_menu)
+    app._function_menu = ctk.CTkOptionMenu(
+        functions, values=list(labels), command=choose, height=32,
+        fg_color=SURFACE, button_color=ACCENT, text_color=TEXT,
+        dropdown_fg_color=SURFACE, dropdown_text_color=TEXT)
+    app._function_menu.set(next(label for label, name in labels.items() if name == profile))
+    app._function_menu.pack(side="left", fill="x", expand=True)
+    _keyboard_menu(app._function_menu, choose)
     status = _surface(outer)
     status.pack(fill="x", pady=(0, 12))
     inner = ctk.CTkFrame(status, fg_color="transparent")
-    inner.pack(fill="x", padx=18, pady=16)
-    _label(inner, "STAN URZĄDZENIA", size=12, text_color=MUTED).pack(anchor="w", pady=(0, 8))
+    inner.pack(fill="x", padx=16, pady=10)
+    _label(inner, "STAN URZĄDZENIA", size=12, text_color=MUTED, height=20).pack(anchor="w", pady=(0, 8))
     for variable in (app._conn, app._output):
-        _label(inner, textvariable=variable, size=16, anchor="w").pack(fill="x")
+        _label(inner, textvariable=variable, size=16, anchor="w", height=24).pack(fill="x")
     for variable in (app._chips, app._detail):
         _label(inner, textvariable=variable, text_color=MUTED, wraplength=510,
-               justify="left", anchor="w").pack(fill="x", pady=(4, 0))
+               justify="left", anchor="w", height=0).pack(fill="x", pady=(4, 0))
     meter = _surface(outer)
     meter.pack(fill="both", expand=True, pady=(0, 12))
-    _label(meter, textvariable=app._meter, wraplength=510, justify="left", anchor="w").pack(fill="both", expand=True, padx=18, pady=16)
+    _label(meter, textvariable=app._meter, wraplength=510, justify="left", anchor="w").pack(fill="both", expand=True, padx=18, pady=12)
     actions = ctk.CTkFrame(outer, fg_color="transparent")
     actions.pack(fill="x")
     actions.grid_columnconfigure((0, 1, 2), weight=1, uniform="actions")
@@ -129,8 +149,12 @@ def build_device_screen(app: Any, title: str, *, from_menu: bool) -> None:
     if from_menu or app.view == "panel":
         entries.append(("Menu", "menu", app._back_to_menu_from_device, False))
     entries.append(("Zamknij", "close", app.close, False))
+    entries.append(("Zapisz", "save", app._save_config, False))
+    app._device_action_buttons = []
     for index, (label, name, command, primary) in enumerate(entries):
-        _button(actions, label, name, command, primary=primary, width=140).grid(
+        button = _button(actions, label, name, command, primary=primary, width=140)
+        button.grid(
             row=index // 3, column=index % 3, sticky="ew", padx=4, pady=4)
+        app._device_action_buttons.append(button)
     _label(outer, textvariable=app._status, text_color=MUTED, anchor="w",
            wraplength=510, justify="left").pack(fill="x", pady=(8, 0))

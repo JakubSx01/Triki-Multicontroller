@@ -11,6 +11,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
+from triki_controller.gui.media_favorite import parse_media_favorite
 
 from triki_controller.motion.orientation import (
     DEFAULT_ORIENTATION,
@@ -53,6 +54,7 @@ _TOP_LEVEL = {
     "axis_map",
     "media_gestures_enabled",
     "media_player",
+    "media_favorite",
     "control_bindings",
 }
 
@@ -75,11 +77,13 @@ class GuiSettings:
     media_gestures_enabled: bool = True
     media_player: str | None = None
     control_bindings: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    media_favorite: Mapping[str, str] | None = None
 
     def to_json(self) -> dict[str, object]:
         return {
             "media_gestures_enabled": self.media_gestures_enabled,
             "media_player": self.media_player,
+            "media_favorite": parse_media_favorite(self.media_favorite),
             "control_bindings": parse_control_bindings(self.control_bindings),
             "schema_version": SETTINGS_SCHEMA_VERSION,
             "profile": self.profile,
@@ -146,6 +150,11 @@ def parse_settings(data: object) -> GuiSettings:
     if player is not None and (not isinstance(player, str) or not player.strip()):
         errors.append("media_player: must be a nonempty string or null")
     bindings = parse_control_bindings(data.get("control_bindings", {}), errors)
+    favorite = None
+    try:
+        favorite = parse_media_favorite(data.get("media_favorite"))
+    except ValueError as exc:
+        errors.append(str(exc))
     if errors:
         raise SettingsError(errors)
     return GuiSettings(
@@ -158,6 +167,7 @@ def parse_settings(data: object) -> GuiSettings:
         media_gestures_enabled=enabled,
         media_player=player,
         control_bindings=bindings,
+        media_favorite=favorite,
     )
 
 

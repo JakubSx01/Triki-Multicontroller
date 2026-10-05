@@ -53,7 +53,7 @@ from triki_controller.gui.present import (
     steering_preview,
 )
 from triki_controller.gui.preview_cards import PreviewDashboard
-from triki_controller.gui.control_options import ControlOptions, _focusable
+from triki_controller.gui.control_options import ControlOptions
 from triki_controller.gui.session import ControllerSession
 from triki_controller.gui.settings import (
     PROFILE_NAMES,
@@ -493,7 +493,11 @@ class ConfigForm(ctk.CTkFrame):
         settings: GuiSettings,
         *,
         on_draft: Callable[[GuiSettings], str | None] | None = None,
+        on_player_select: Callable[[str | None], str | None] | None = None,
         list_players: Callable[[], list[tuple[str, str]]] | None = None,
+        favorite_descriptor: Callable[[str], dict[str, str]] | None = None,
+        favorite_descriptors: Callable[[list[str]], dict[str, dict[str, str]]] | None = None,
+        active_favorite: Callable[[], dict[str, str] | None] | None = None,
     ) -> None:
         super().__init__(parent, fg_color="transparent")
         self._on_draft = on_draft
@@ -551,7 +555,11 @@ class ConfigForm(ctk.CTkFrame):
                 self._add_slider(page, name, field, profile_thresholds)
             options = ControlOptions(page, replace(settings, profile=name),
                                      on_change=lambda _settings: self._emit_draft(),
-                                     list_players=list_players)
+                                     on_player_select=on_player_select,
+                                     list_players=list_players,
+                                     favorite_descriptor=favorite_descriptor,
+                                     favorite_descriptors=favorite_descriptors,
+                                     active_favorite=active_favorite)
             options.pack(fill="x", pady=(8, 0))
             self.control_options[name] = options
         initial = PROFILE_LABELS.get(str(self._draft["profile"]), PROFILE_LABELS["steering"])
@@ -710,6 +718,7 @@ class ConfigForm(ctk.CTkFrame):
         collected = replace(settings_from_draft(draft, profile=profile),
                             media_gestures_enabled=self._settings.media_gestures_enabled,
                             media_player=self._settings.media_player,
+                            media_favorite=self._settings.media_favorite,
                             control_bindings=self._settings.control_bindings)
         for options in self.control_options.values():
             collected = options.collect(collected)
@@ -860,11 +869,22 @@ class TrikiDesktop:
         self._quick_command = command
         self._autostart.live = not self.dry_run
         self._autostart.enabled = True
-        self._autostart._armed = False
+        # A profile change may already have rebuilt running output in session.
+        # Only a stopped output needs the normal one-shot streaming autostart.
+        from triki_controller.gui.session import OutputMode
+        self._autostart._armed = self.session.snapshot().output_mode != OutputMode.OFF
         self._show_device_screen(from_menu=True)
-        self.root.after(80, self._startup_connect)
+        if self.session.snapshot().connection in {ConnectionState.DISCONNECTED, ConnectionState.ERROR}:
+            self.root.after(80, self._connect_device_if_needed)
+
+    def _connect_device_if_needed(self) -> None:
+        # A scheduled launch belongs to the current device intent, not a stale
+        # screen which the user may already have left.
+        if self._screen == "device" and self._autostart.enabled:
+            self._startup_connect()
 
     def _show_device_screen(self, *, from_menu: bool) -> None:
+        retain_geometry = self._screen == "device"
         self._screen = "device"
         title = self.root.title()
         if self._quick_command == "mouse":
@@ -876,32 +896,40 @@ class TrikiDesktop:
         elif self._quick_command == "plane":
             title = "Triki Joystick"
         self.root.title(title)
-        self.root.geometry("660x560")
-        self.root.minsize(620, 540)
+        if not retain_geometry:
+            self.root.geometry("660x820")
+        self.root.minsize(620, 700)
         self._clear_content()
         assert self._content is not None
         from triki_controller.gui.shell_presentation import build_device_screen
 
         build_device_screen(self, title, from_menu=from_menu)
         outer = self._content.winfo_children()[0]
-        options_area = ctk.CTkScrollableFrame(outer, fg_color="transparent", height=230)
+        options_area = ctk.CTkScrollableFrame(outer, fg_color="transparent", height=210)
         options_area.pack(fill="x", pady=(0, 8), before=outer.pack_slaves()[2])
         self._control_options = ControlOptions(
             options_area, self.session.current_settings(), on_change=self._apply_control_options,
-            list_players=self.session.list_media_players)
+            on_player_select=self._select_media_player,
+            list_players=self.session.list_media_players,
+            favorite_descriptor=self.session.favorite_media_descriptor,
+            favorite_descriptors=self.session.favorite_media_descriptors,
+            active_favorite=self.session.active_media_favorite)
         self._control_options.pack(fill="x")
-        save_button = ctk.CTkButton(options_area, text="Zapisz", command=self._save_config,
-                                   fg_color=_ACCENT)
-        save_button.pack(anchor="w", pady=4)
-        _focusable(save_button, save_button.invoke)
-        self.root.geometry("660x820")
-        self.root.minsize(620, 700)
+
+    def _select_media_player(self, player: str | None) -> str | None:
+        previous = self.session.current_settings().media_player
+        error = self.session.select_media_player(player)
+        if error is None and player != previous:
+            self._dirty = True
+            self._dirty_label.set("Niezapisane zmiany")
+        return error
 
     def _apply_control_options(self, settings: GuiSettings) -> str | None:
         # Apply only added controls onto the latest session draft.
         current = self.session.current_settings()
         candidate = replace(current, control_bindings=settings.control_bindings,
                             media_player=settings.media_player,
+                            media_favorite=settings.media_favorite,
                             media_gestures_enabled=settings.media_gestures_enabled)
         error = self.session.apply_settings(candidate)
         if error is None:
@@ -910,9 +938,8 @@ class TrikiDesktop:
         return error
 
     def _back_to_menu_from_device(self) -> None:
-        self.session.stop_output()
-        self.session.disconnect()
-        self._autostart.enabled = False
+        # The menu owns dirty confirmation before releasing any held output.
+        # Navigation is not a BLE disconnect; only the explicit action is.
         self._show_main_menu()
 
     def _show_configurator(self) -> None:
@@ -1121,7 +1148,11 @@ class TrikiDesktop:
         ctk.CTkLabel(pad, text="Mapowanie i progi", text_color=_MUTED, anchor="w").pack(anchor="w")
         self._config_form = ConfigForm(
             pad, self.session.current_settings(), on_draft=self._apply_draft_from_form,
+            on_player_select=self._select_media_player,
             list_players=self.session.list_media_players,
+            favorite_descriptor=self.session.favorite_media_descriptor,
+            favorite_descriptors=self.session.favorite_media_descriptors,
+            active_favorite=self.session.active_media_favorite,
         )
         self._config_form.pack(fill="both", expand=True)
         # Rebind on_draft properly — ConfigForm calls with GuiSettings(); use wrapper.
@@ -1204,6 +1235,8 @@ class TrikiDesktop:
     def _startup_connect(self) -> None:
         if self._closed:
             return
+        if self.session.snapshot().connection not in {ConnectionState.DISCONNECTED, ConnectionState.ERROR}:
+            return
         self._on_connect()
 
     def _on_connect(self) -> None:
@@ -1222,6 +1255,7 @@ class TrikiDesktop:
         self.root.after(700, self._on_connect)
 
     def _on_disconnect(self) -> None:
+        self._autostart.enabled = False
         self.session.disconnect()
         self._flash("Rozłączono.")
 
@@ -1242,6 +1276,7 @@ class TrikiDesktop:
         self._flash(self.session.start_output(live=True) or "Wyjście na żywo.")
 
     def _on_stop(self) -> None:
+        self._autostart.enabled = False
         self.session.stop_output()
         self._flash("Sterowanie zatrzymane.")
 

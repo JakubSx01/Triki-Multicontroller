@@ -46,6 +46,13 @@ def test_legacy_configurator_elements_remain_byte_for_byte_preserved():
         segment = ast.get_source_segment(source, nodes[name])
         assert segment is not None
         if name == "_build_config_editor":
+            for addition in (
+                "\n            on_player_select=self._select_media_player,",
+                "\n            favorite_descriptor=self.session.favorite_media_descriptor,",
+                "\n            favorite_descriptors=self.session.favorite_media_descriptors,",
+                "\n            active_favorite=self.session.active_media_favorite,",
+            ):
+                segment = segment.replace(addition, "")
             segment = segment.replace(
                 "on_draft=self._apply_draft_from_form,\n            list_players=self.session.list_media_players,",
                 "on_draft=self._apply_draft_from_form",

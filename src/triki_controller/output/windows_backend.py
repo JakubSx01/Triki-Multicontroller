@@ -67,6 +67,18 @@ class WindowsOutputBackend:
                 self.audio = WindowsAudio()
             return self.audio.list_media_players()
 
+    def favorite_media_descriptors(self, player_ids=None) -> dict[str, dict[str, str]]:
+        with self._lock:
+            if self.audio is None:
+                from triki_controller.output.windows_audio import WindowsAudio
+                self.audio = WindowsAudio()
+            audio = self.audio
+        return audio.favorite_media_descriptors(player_ids)
+
+    def favorite_media_descriptor(self, player_id: str) -> dict[str, str]:
+        self.list_media_players()  # Lazily construct only the observational adapter.
+        return self.audio.favorite_media_descriptor(player_id)
+
     def select_media_player(self, player_id: str | None) -> None:
         with self._lock:
             self._media_player = player_id
@@ -175,6 +187,10 @@ class WindowsOutputBackend:
                             errors.append('selected player discovery unavailable; global transport blocked')
                             continue
                         if not perform('selected player', check):
+                            continue
+                        from triki_controller.gui.media_favorite import selector_favorite
+                        if selector_favorite(self._media_player, 'windows') is not None:
+                            errors.append('favorite targeted transport unavailable on Windows; global transport blocked')
                             continue
                     perform('global media key', self.input.transport, pulse)
                 elif pulse in INPUT_ACTIONS:

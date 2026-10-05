@@ -49,6 +49,13 @@ class MacOSOutputBackend:
     def list_media_players(self) -> list[tuple[str, str]]:
         return self.player.list_media_players()
 
+    def favorite_media_descriptors(self, player_ids=None) -> dict[str, dict[str, str]]:
+        return self.player.favorite_media_descriptors(player_ids)
+
+    def favorite_media_descriptor(self, player_id: str) -> dict[str, str]:
+        self.list_media_players()  # Lazily construct only the observational adapter.
+        return self.player.favorite_media_descriptor(player_id)
+
     def select_media_player(self, player_id: str | None) -> None:
         self.player.select_media_player(player_id)
 

@@ -7,6 +7,8 @@ Native paths need macOS validation; importing this file is platform-neutral.
 """
 from __future__ import annotations
 
+from triki_controller.gui.media_favorite import selector_favorite, unique_favorite_target
+
 import ctypes
 from dataclasses import dataclass
 import math
@@ -253,6 +255,8 @@ class NativeMacOSAudio:
             self.BUNDLES[player]) if not app.isTerminated()]
         if not processes:
             raise MacOSAudioError(f"{player} is not running; will not launch it")
+        if len(processes) != 1:
+            raise MacOSAudioError(f"{player} process identity ambiguous; refusing target")
         return processes[0]
 
     @staticmethod
@@ -455,6 +459,44 @@ class MacOSPlayerVolume:
     def list_media_players(self) -> list[tuple[str, str]]:
         return [(name, name) for name in self.adapter.list_players()]
 
+    def _favorite_candidates(self, players):
+        candidates = []
+        for player in players:
+            identity = self.adapter.player_identity(player)
+            app_id = identity[0] if isinstance(identity, tuple) and identity else None
+            if not isinstance(app_id, str) or not app_id:
+                raise ValueError("Stable macOS bundle identity unavailable")
+            candidates.append((player, app_id))
+        return candidates
+
+    def favorite_media_descriptors(self, player_ids=None) -> dict[str, dict[str, str]]:
+        """Read each bundle identity once, without changing selected/baseline state."""
+        players = self.adapter.list_players() if player_ids is None else player_ids
+        entries = {}
+        for player in dict.fromkeys(players):
+            try:
+                identity = self.adapter.player_identity(player)
+                app_id = identity[0] if isinstance(identity, tuple) and identity else None
+                if isinstance(app_id, str) and app_id:
+                    entries[player] = app_id
+            except (ValueError, MacOSAudioError):
+                pass
+        counts = {}
+        for app in entries.values():
+            counts[app] = counts.get(app, 0) + 1
+        return {p: {"platform": "macos", "app_id": app, "label": p}
+                for p, app in entries.items() if counts[app] == 1}
+
+    def favorite_media_descriptor(self, player_id: str) -> dict[str, str]:
+        players = self.adapter.list_players()
+        if player_id not in players:
+            raise ValueError("Selected player unavailable")
+        candidates = self._favorite_candidates(players)
+        app_id = next(app for key, app in candidates if key == player_id)
+        descriptor = {"platform": "macos", "app_id": app_id, "label": player_id}
+        unique_favorite_target(descriptor, candidates)
+        return descriptor
+
     def select_media_player(self, player_id: str | None) -> None:
         self._manual_player = player_id
         self._selected = player_id
@@ -463,11 +505,14 @@ class MacOSPlayerVolume:
 
     def _select(self):
         players = self.adapter.list_players()
-        if self._manual_player is not None and self._manual_player not in players:
+        favorite = selector_favorite(self._manual_player, "macos")
+        target = (unique_favorite_target(favorite, self._favorite_candidates(players))
+                  if favorite is not None else self._manual_player)
+        if target is not None and target not in players:
             self.leave()
             raise MacOSAudioError(f"selected player unavailable: {self._manual_player}; no substitution")
-        if self._manual_player is not None:
-            self._selected = self._manual_player
+        if target is not None:
+            self._selected = target
         if not players:
             self._selected = None
             self.leave()
