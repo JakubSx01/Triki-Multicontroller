@@ -173,11 +173,18 @@ def test_device_actions_fit_and_extension_hook(app):
             walk(child)
     walk(app._content)
     assert {button.cget("text") for button in buttons} == {
-        "Połącz ponownie", "Zatrzymaj sterowanie", "Rozłącz", "Menu", "Zamknij", "Zapisz"}
-    for button in buttons:
+        "Połącz", "Połącz ponownie", "Zatrzymaj", "Rozłącz", "Menu", "Zamknij", "Zapisz",
+        "Konfigurator", "Sterowanie", "Przypisania", "Diagnostyka"}
+    visible = app._device_action_buttons + app._shell_navigation_buttons + list(app._shell_tab_buttons.values())
+    for button in visible:
         assert button.winfo_ismapped()
         assert button.winfo_rootx() + button.winfo_width() <= app.root.winfo_rootx() + app.root.winfo_width()
         assert button.winfo_rooty() + button.winfo_height() <= app.root.winfo_rooty() + app.root.winfo_height()
+    assert not any(button.winfo_viewable() for button in app._diagnostic_action_buttons)
+    app._show_shell_page("Diagnostyka")
+    app.root.update_idletasks()
+    for button in app._diagnostic_action_buttons:
+        assert button.winfo_ismapped()
     attach = Mock(return_value="extension")
     assert app.attach_shell_extension(attach) == "extension"
     attach.assert_called_once_with(app)

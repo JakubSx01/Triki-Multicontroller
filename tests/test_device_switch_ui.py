@@ -5,6 +5,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from tests.gui_tk_harness import control_size, settle
 from triki_controller.core.models import ConnectionState
 from triki_controller.gui.desktop import TrikiDesktop
 from triki_controller.gui.session import ControllerSession
@@ -68,19 +69,17 @@ def test_launch_reuses_streaming_or_pending_connection(app, state):
 
 def test_function_selector_keyboard_and_narrow_layout(app):
     app._launch_device('mouse')
-    app.root.geometry('620x700')
-    app.root.update()
+    control_size(app, (620, 700))
     menu = app._function_menu
     tk.Misc.focus_force(menu)
-    app.root.update()
+    settle(app)
     menu.event_generate('<Right>')
-    app.root.update()
+    settle(app)
     assert app.session.current_settings().profile == 'plane'
     assert app._function_menu.get() == 'Joystick'
     assert app.root.focus_get() == app._function_menu
     app.session.disconnect.assert_not_called()
-    app.root.geometry('620x700')
-    app.root.update()
+    control_size(app, (620, 700))
     for button in app._device_action_buttons:
         assert button.winfo_ismapped()
         assert button.winfo_rootx() >= app.root.winfo_rootx()
@@ -103,10 +102,9 @@ def test_stale_launch_callback_and_stop_cannot_arm_after_navigation(app):
 
 def test_function_rebuild_keeps_existing_window_geometry(app):
     app._launch_device('mouse')
-    app.root.geometry('620x700')
-    app.root.update()
+    control_size(app, (620, 700))
     app._function_menu._command('Multimedia')
-    app.root.update()
+    settle(app)
     assert (app.root.winfo_width(), app.root.winfo_height()) == (620, 700)
     assert 'Zapisz' in {button.cget('text') for button in app._device_action_buttons}
 

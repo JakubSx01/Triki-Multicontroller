@@ -898,17 +898,15 @@ class TrikiDesktop:
         self.root.title(title)
         if not retain_geometry:
             self.root.geometry("660x820")
-        self.root.minsize(620, 700)
+        self.root.minsize(520, 600)
         self._clear_content()
         assert self._content is not None
         from triki_controller.gui.shell_presentation import build_device_screen
 
         build_device_screen(self, title, from_menu=from_menu)
-        outer = self._content.winfo_children()[0]
-        options_area = ctk.CTkScrollableFrame(outer, fg_color="transparent", height=210)
-        options_area.pack(fill="x", pady=(0, 8), before=outer.pack_slaves()[2])
         self._control_options = ControlOptions(
-            options_area, self.session.current_settings(), on_change=self._apply_control_options,
+            self._options_parent, self.session.current_settings(), compact=True,
+            on_change=self._apply_control_options,
             on_player_select=self._select_media_player,
             list_players=self.session.list_media_players,
             favorite_descriptor=self.session.favorite_media_descriptor,
@@ -1276,6 +1274,11 @@ class TrikiDesktop:
         self._flash(self.session.start_output(live=True) or "Wyjście na żywo.")
 
     def _on_stop(self) -> None:
+        from triki_controller.gui.session import OutputMode
+        mode = self.session.snapshot().output_mode
+        # Retain the running intent for Resume; pending intent already lives here.
+        if mode != OutputMode.OFF:
+            self._autostart.live = mode == OutputMode.LIVE
         self._autostart.enabled = False
         self.session.stop_output()
         self._flash("Sterowanie zatrzymane.")
@@ -1389,6 +1392,9 @@ class TrikiDesktop:
             detail = f"{detail} Użyj „Połącz ponownie”."
         self._set(self._detail, detail or "")
         self._set(self._meter, _meter_text(snap))
+        if self._screen == "device":
+            from triki_controller.gui.shell_presentation import refresh_device_actions
+            refresh_device_actions(self)
         if self._profile.get() != snap.profile_name:
             self._profile.set(snap.profile_name)
         if self._sensors is not None:

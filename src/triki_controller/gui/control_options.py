@@ -10,7 +10,7 @@ import customtkinter as ctk
 
 from triki_controller.gui.settings import GuiSettings
 from triki_controller.gui.shell_icons import icon
-from triki_controller.gui.shell_presentation import SURFACE, TEXT, MUTED, ACCENT, BORDER, ICON_COLOR
+from triki_controller.gui.shell_presentation import SURFACE, TEXT, MUTED, ACCENT, BORDER, ICON_COLOR, _wrap_label
 from triki_controller.profiles.control_bindings import BINDING_ACTIONS, BINDING_SOURCES
 
 SOURCE_LABELS = {
@@ -98,7 +98,8 @@ class ControlOptions(ctk.CTkFrame):
                  list_players: Callable[[], list[tuple[str, str]]] | None = None,
                  favorite_descriptor: Callable[[str], dict[str, str]] | None = None,
                  favorite_descriptors: Callable[[list[str]], dict[str, dict[str, str]]] | None = None,
-                 active_favorite: Callable[[], dict[str, str] | None] | None = None):
+                 active_favorite: Callable[[], dict[str, str] | None] | None = None,
+                 compact: bool = False):
         super().__init__(parent, fg_color=SURFACE, corner_radius=8,
                          border_width=1, border_color=BORDER)
         self.settings = settings
@@ -114,6 +115,60 @@ class ControlOptions(ctk.CTkFrame):
         self._player_values = {_AUTO: None}
         self.message = tk.StringVar(self, value='Zmiany działają w sesji. Tylko „Zapisz” utrwala plik.')
         self._build()
+        if compact:
+            self._adapt_shell_layout()
+
+    def _adapt_shell_layout(self):
+        """Reflow only the additive shell editor; leave configurator builders alone."""
+        pad = next(child for child in self.winfo_children() if isinstance(child, ctk.CTkFrame))
+        for child in pad.winfo_children():
+            if isinstance(child, ctk.CTkLabel) and child.cget('text') == 'Opcje sterowania':
+                child.pack_forget()
+        if self.player_menu is None:
+            grid = self.binding_menus['button'].master
+            rows = []
+            for source in BINDING_SOURCES:
+                menu = self.binding_menus[source]
+                info = menu.grid_info()
+                label = grid.grid_slaves(row=info['row'], column=info['column'] - 1)[0]
+                rows.append((label, menu))
+            for index, (label, menu) in enumerate(rows):
+                label.grid(row=index, column=0, sticky='w', padx=(0, 12), pady=6)
+                menu.grid(row=index, column=1, sticky='ew', padx=0, pady=6)
+            grid.grid_columnconfigure(3, weight=0)
+        else:
+            self.refresh_button.configure(fg_color=SURFACE, text_color=TEXT,
+                                          border_width=1, border_color=BORDER,
+                                          height=36)
+            self.gesture_toggle.pack_forget()
+            policy = next(child for child in pad.winfo_children()
+                          if isinstance(child, ctk.CTkLabel) and str(child.cget('textvariable')) == str(self.gesture_policy))
+            policy.pack_forget()
+            self._gestures_open = False
+            def toggle():
+                self._gestures_open = not self._gestures_open
+                self.gesture_disclosure.configure(text='Ukryj zasady gestów' if self._gestures_open else 'Gesty i zasady wyboru…')
+                if self._gestures_open:
+                    self.gesture_toggle.pack(anchor='w', pady=8)
+                    policy.pack(fill='x', pady=4)
+                else:
+                    self.gesture_toggle.pack_forget()
+                    policy.pack_forget()
+            from triki_controller.gui.shell_presentation import _button
+            self.gesture_disclosure = _button(pad, 'Gesty i zasady wyboru…', 'config', toggle)
+            self.gesture_disclosure.pack(fill='x', pady=(8, 4))
+        def wrap_children(widget):
+            for child in widget.winfo_children():
+                if isinstance(child, ctk.CTkLabel):
+                    child.configure(font=ctk.CTkFont(size=14))
+                    if child.winfo_manager() == 'pack' and child.pack_info().get('fill') == 'x':
+                        _wrap_label(child)
+                    else:
+                        child.configure(wraplength=0)
+                elif isinstance(child, ctk.CTkOptionMenu):
+                    child.configure(height=36, width=150, font=ctk.CTkFont(size=14))
+                wrap_children(child)
+        wrap_children(pad)
 
     def _label(self, parent, text, **kwargs):
         return ctk.CTkLabel(parent, text=text, text_color=kwargs.pop('text_color', TEXT), **kwargs)

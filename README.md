@@ -2,7 +2,7 @@
 
 Triki Controller łączy nakładkę Triki CAP001 przez Bluetooth Low Energy (BLE) i zamienia jej ruch na **Kierownicę**, **AirMouse**, **Joystick** albo **Multimedia**. Interfejs to aplikacja desktopowa Tkinter/CustomTkinter, nie strona WWW. CLI służy także do diagnostyki i zapisu surowych próbek.
 
-> **Zakres tej instrukcji:** bieżący kod dla wydania v0.1.3 i pakiety zbudowane z niego. Starsze archiwa, np. v0.1.2, nie mają ulubionego celu startowego i nowych kontrolek zmiany funkcji. Aktualizacja README nie oznacza, że funkcje przeszły QA na fizycznej nakładce lub na wszystkich systemach.
+> **Zakres tej instrukcji:** bieżący kod dla wydania v0.1.4 i pakiety zbudowane z niego. Wersja v0.1.4 porządkuje ekran sterowania, przypisania i diagnostykę; wcześniejsze v0.1.3 zawiera ulubiony cel startowy, ale nie ma nowego układu ani poprawek Stop/Wznów. Aktualizacja README nie oznacza, że funkcje przeszły QA na fizycznej nakładce lub na wszystkich systemach.
 >
 > Obsługa CAP001 nadal używa parsera `reference-hypothesis` opartego na TrikiScope. Format ramek i przeliczniki 2048 LSB/g oraz 131 LSB/(°/s) nie są pełną akceptacją protokołu HOM-27. Syntetyczne testy i podgląd nie zastępują pomiarów sprzętowych.
 
@@ -127,11 +127,11 @@ W dalszych przykładach `triki-controller` oznacza polecenie z zainstalowanego �
 4. Poczekaj na strumień próbek. Trzymaj nakładkę spokojnie w pozycji neutralnej: aplikacja ustala początek ruchu po krótkim rozruchu strumienia.
 5. Wybierz zakładkę profilu w **Konfiguracja**, obejrzyj czujniki i mapowanie. Użyj **Próbne**, aby sprawdzić wyjście bez zdarzeń systemowych.
 6. Dopiero potem użyj **Na żywo**. Mysz może zacząć poruszać kursorem, własne przypisania mogą przytrzymywać klawisze, a Multimedia zmieniać audio. Zacznij od niskiej głośności i neutralnej pozycji.
-7. **Stop** / **Zatrzymaj sterowanie** wyłącza wyjście, ale nie rozłącza BLE. **Rozłącz** kończy połączenie i zatrzymuje wyjście.
+7. **Stop** / **Zatrzymaj** wyłącza wyjście, ale nie rozłącza BLE. **Rozłącz** kończy połączenie i zatrzymuje wyjście.
 
-**Uwaga na szybki start:** przycisk **Uruchom** na karcie urządzenia oraz komendy `mouse`, `wheel`, `music` łączą BLE i automatycznie uzbrajają **Live**, gdy pojawi się strumień. Konfigurator nie uzbraja Live automatycznie — może jednak wysyłać zdarzenia po świadomym kliknięciu **Na żywo**. CLI `gui --dry-run` pozwala uruchomić panel z szybkim startem w trybie próbnym.
+**Uwaga na szybki start:** przycisk **Otwórz** na karcie urządzenia oraz komendy `mouse`, `wheel`, `music` łączą BLE i automatycznie uzbrajają **Live**, gdy pojawi się strumień. Konfigurator nie uzbraja Live automatycznie — może jednak wysyłać zdarzenia po świadomym kliknięciu **Na żywo**. CLI `gui --dry-run` pozwala uruchomić panel z szybkim startem w trybie próbnym.
 
-Po utracie połączenia wyjście jest zatrzymywane. **Połącz ponownie** ponawia skanowanie; ponownie obudź Triki jednym naciśnięciem. Szybkie tryby mogą po nowym strumieniu ponownie uzbroić wyjście. W konfiguratorze sprawdź stan i wybierz tryb wyjścia jawnie. Po zatrzymaniu szybki ekran nie ma osobnego przycisku Start: użyj **Połącz ponownie** albo wróć do menu i uruchom profil.
+Po utracie połączenia wyjście jest zatrzymywane. **Połącz** ponawia próbę po rozłączeniu/błędzie; ponownie obudź Triki jednym naciśnięciem. Szybkie tryby mogą po nowym strumieniu ponownie uzbroić wyjście. **Zatrzymaj** jest dostępne także podczas oczekującego automatycznego startu i anuluje ten zamiar. Po zatrzymaniu przy zachowanym strumieniu użyj **Wznów** lub **Wznów próbne** — bez ponownego łączenia, z zachowaniem ostatniego działającego trybu. **Połącz ponownie** w Diagnostyce wymusza nową sesję BLE. W konfiguratorze wybierz tryb wyjścia jawnie.
 
 **Zmiana funkcji nie wymaga ponownego połączenia.** Na ekranie urządzenia użyj listy **Funkcja** albo wróć do **Menu** i uruchom inny profil. Istniejąca sesja BLE i strumień pozostają te same; aplikacja zwalnia stare wejścia i przełącza mapowanie/wyjście. Podczas trwającego skanowania lub łączenia nowa funkcja użyje już rozpoczętej próby, bez drugiego połączenia. Błąd przełączenia zatrzymuje wyjście i zgłasza problem — nie wymusza rozłączenia BLE. **Połącz ponownie** jest naprawą połączenia, nie standardowym sposobem zmiany funkcji.
 
@@ -143,10 +143,10 @@ Normalne zatrzymanie, zmiana profilu, rozłączenie i zamknięcie zwalniają prz
 
 | Element | Jak używać |
 | --- | --- |
-| **Kierownica → Uruchom** | Pionowo trzymana nakładka: skręt, gaz i hamulec. Rozpoczyna BLE + Live. |
-| **AirMouse → Uruchom** | Poziomo trzymana nakładka: prędkość kursora i kliknięcia. Rozpoczyna BLE + Live. |
-| **Joystick → Uruchom** | Poziome, utrzymywane wychylenie drążka. Rozpoczyna BLE + Live, z ograniczeniami platformy. |
-| **Multimedia → Uruchom** | Pokrętło głośności i sterowanie odtwarzaniem. Rozpoczyna BLE + Live. Nazwa komendy CLI to `music`. |
+| **Kierownica → Otwórz** | Pionowo trzymana nakładka: skręt, gaz i hamulec. Rozpoczyna BLE + Live. |
+| **AirMouse → Otwórz** | Poziomo trzymana nakładka: prędkość kursora i kliknięcia. Rozpoczyna BLE + Live. |
+| **Joystick → Otwórz** | Poziome, utrzymywane wychylenie drążka. Rozpoczyna BLE + Live, z ograniczeniami platformy. |
+| **Multimedia → Otwórz** | Pokrętło głośności i sterowanie odtwarzaniem. Rozpoczyna BLE + Live. Nazwa komendy CLI to `music`. |
 | **Konfigurator** | Otwiera edytor mapowania, progów i podgląd w tym samym procesie; zatrzymuje dotychczasowe wyjście. |
 | **Utwórz skróty** | Zapisuje skróty uruchamiania w katalogach użytkownika; to nie zapis ustawień profilu. |
 
@@ -155,13 +155,13 @@ Normalne zatrzymanie, zmiana profilu, rozłączenie i zamknięcie zwalniają prz
 - **Stan urządzenia:** połączenie BLE, tryb sterowania, przycisk, bateria/RSSI (jeżeli dostępne), liczba próbek i szczegóły błędu. **Hz** to częstotliwość otrzymywanych próbek, nie liczba FPS gry.
 - **Funkcja:** przełącza Kierownicę, AirMouse, Joystick i Multimedia bez rozłączania urządzenia. W menu także widać stan zachowanego połączenia.
 - **Wartości profilu:** kierownica w stopniach i pedały w %, prędkość kursora w px/s, wychylenie joysticka X/Y albo głośność z mapowania. To podgląd obliczeń, nie potwierdzenie reakcji zewnętrznej aplikacji.
-- **Opcje sterowania:** własne przypisania dla Kierownicy/AirMouse/Joysticka; dla Multimediów — wybór odtwarzacza i przełącznik potrząśnięcia. Sekcja jest przewijana.
+- **Sterowanie / Przypisania / Diagnostyka:** podstawowe zadanie, własne klawisze i dane techniczne są rozdzielone. Multimedia pokazują wybór odtwarzacza i ulubionego; gesty rozwija się osobno. Diagnostyka zawiera szczegóły błędów, ponowne połączenie i rozłączanie. Długie komunikaty mają niezależne przewijanie, a dolne akcje pozostają dostępne.
 - **Zapisz:** utrwala aktualne ustawienia; sama zmiana listy lub przełącznika działa w sesji, bez zapisu pliku.
 
 | Przycisk | Działanie |
 | --- | --- |
 | **Połącz ponownie** | Rozłącza trwającą sesję, jeżeli trzeba, i uruchamia nowy skan BLE. |
-| **Zatrzymaj sterowanie** | Zatrzymuje i neutralizuje wyjście; zostawia połączenie BLE. |
+| **Zatrzymaj** | Zatrzymuje i neutralizuje wyjście lub anuluje oczekujący start; zostawia połączenie BLE. |
 | **Rozłącz** | Kończy BLE i wyjście. |
 | **Menu** | Pyta o niezapisane zmiany, zatrzymuje sterowanie i wraca do menu głównego, **zachowując BLE**. Uruchomienie innej funkcji wykorzysta to połączenie. Anulowanie pytania pozostawia bieżący ekran i sterowanie bez zmian. |
 | **Zamknij** | Kończy aplikację, z pytaniem o niezapisane zmiany. |
