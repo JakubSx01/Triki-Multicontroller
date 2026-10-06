@@ -243,9 +243,10 @@ class MprisPlayerVolume:
         player = self._select_player(binary)
         if player is None:
             return None
-        if player in self._stream_players or self._looks_like_chromium_stub(player, None):
+        if self._should_use_stream(player):
+            # Spotify desktop Volume can be a stub; baseline the actual app stream.
             stream_vol = self._stream.read_level(self._stream_target(player))
-            if stream_vol is not None:
+            if stream_vol is not None or self._is_spotify(player):
                 return stream_vol
         return self._read_volume(binary, player)
 
@@ -300,23 +301,28 @@ class MprisPlayerVolume:
         volume = self._read_volume(binary, active)
         stream_volume = None
         stub = self._looks_like_chromium_stub(active, identity)
-        if active in self._stream_players or stub:
+        if self._should_use_stream(active):
             stream_volume = self._stream.read_level(self._stream_target(active))
-            if stub:
-                volume = stream_volume
+            volume = stream_volume
         self._cached_player = active
         self._cached_identity = identity
         label = self._friendly_name(active, identity)
         writable = self._volume_writable_for(active)
         if stream_volume is not None:
             writable = True
-        elif stub:
+        elif stub or self._is_spotify(active):
             writable = None
         if stream_volume is not None:
             detail = (
                 f"mpris: aktywny {label} — głośność aplikacji {volume:.0%} "
-                f"(strumień PipeWire; MPRIS Volume w Pear/Chromium nie działa). "
+                f"(strumień audio aplikacji przez PipeWire/Pulse). "
                 f"Transport: MPRIS, przy braku komendy → uinput."
+            )
+        elif self._is_spotify(active):
+            detail = (
+                "Spotify: brak lokalnego strumienia audio. Uruchom odtwarzanie na tym komputerze; "
+                "sterowanie głośnością używa PipeWire/Pulse, nie miksera systemowego. "
+                "Sprawdź, czy Spotify Connect nie odtwarza na innym urządzeniu."
             )
         elif writable is False:
             detail = self._volume_unwritable_message(label)
@@ -628,7 +634,14 @@ class MprisPlayerVolume:
         self._unwritable_players.add(player)
         self._writable_players.discard(player)
 
+    @staticmethod
+    def _is_spotify(player: str) -> bool:
+        # Native Spotify MPRIS names, not a browser playing an arbitrary Spotify tab.
+        return player == "spotify" or player.startswith("spotify.instance")
+
     def _should_use_stream(self, player: str) -> bool:
+        if self._is_spotify(player):
+            return True
         if player in self._stream_players:
             return True
         if self._volume_writable_for(player) is False:
@@ -649,6 +662,9 @@ class MprisPlayerVolume:
         if err:
             if "brak strumienia" in err:
                 self.log.append(f"mpris stream pending player={player} target={target:.3f}")
+                if self._is_spotify(player):
+                    self.last_error = "Spotify: brak lokalnego strumienia audio. Uruchom odtwarzanie na tym komputerze; Spotify Connect na innym urządzeniu nie tworzy lokalnego strumienia."
+                    return self.last_error
                 self.last_error = None
                 return None
             label = self._friendly_name(player, self._cached_identity)

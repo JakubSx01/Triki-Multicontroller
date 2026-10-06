@@ -2,7 +2,7 @@
 
 Triki Controller łączy nakładkę Triki CAP001 przez Bluetooth Low Energy (BLE) i zamienia jej ruch na **Kierownicę**, **AirMouse**, **Joystick** albo **Multimedia**. Interfejs to aplikacja desktopowa Tkinter/CustomTkinter, nie strona WWW. CLI służy także do diagnostyki i zapisu surowych próbek.
 
-> **Zakres tej instrukcji:** bieżący kod dla wydania v0.1.4 i pakiety zbudowane z niego. Wersja v0.1.4 porządkuje ekran sterowania, przypisania i diagnostykę; wcześniejsze v0.1.3 zawiera ulubiony cel startowy, ale nie ma nowego układu ani poprawek Stop/Wznów. Aktualizacja README nie oznacza, że funkcje przeszły QA na fizycznej nakładce lub na wszystkich systemach.
+> **Zakres tej instrukcji:** bieżący kod dla wydania v0.1.5 i pakiety zbudowane z niego. Wersja v0.1.5 dodaje regulację lokalnego strumienia Spotify na Linuksie; v0.1.4 porządkuje ekran sterowania, przypisania i diagnostykę. Dla poprawki Spotify nie uruchamiano testów na polecenie użytkownika. Aktualizacja README nie oznacza, że funkcje przeszły QA na fizycznej nakładce lub na wszystkich systemach.
 >
 > Obsługa CAP001 nadal używa parsera `reference-hypothesis` opartego na TrikiScope. Format ramek i przeliczniki 2048 LSB/g oraz 131 LSB/(°/s) nie są pełną akceptacją protokołu HOM-27. Syntetyczne testy i podgląd nie zastępują pomiarów sprzętowych.
 
@@ -233,7 +233,13 @@ Lista przechowuje identyfikator backendu, nie tylko nazwę widoczną na ekranie.
 
 Do zmiany celu potrząśnięciem używaj trybu **Automatycznie**. **Wybór ręczny blokuje zmianę gestem**: przełącznik potrząśnięcia jest wtedy nieaktywny, a GUI wyświetla wyjaśnienie. Po powrocie do **Automatycznie** wraca wcześniej ustawiona wartość przełącznika; nadal możesz wyłączyć gest. Automatyczny wybór zależy od backendu, nie od tego, którą kartę WWW aktualnie oglądasz.
 
-#### Ulubiony odtwarzacz startowy
+### Spotify na Linuksie
+
+Natywny Spotify (`spotify` / `spotify.instance…` w MPRIS) reguluje głośność przez swój lokalny strumień PipeWire/Pulse (`pactl`). Play/pause i zmiana utworu pozostają w MPRIS. Głośność systemowa nie jest używana jako zamiennik; ulubiony nadal wymaga jednoznacznej tożsamości, a strumień jest dobierany według procesu właściciela D-Bus i jego potomków.
+
+Uruchom Spotify desktop i odtwarzanie **na tym komputerze**, potem odśwież listę odtwarzaczy. Spotify Connect grające na telefonie/głośniku nie tworzy lokalnego strumienia. Spotify w przeglądarce ma inną tożsamość MPRIS — poprawka nie zgaduje, który tab odtwarza Spotify. Wymagane zewnętrzne narzędzia: `playerctl`, `busctl`, `pactl` oraz wspólna sesja D-Bus. Poziom strumienia aplikacji nie musi odpowiadać suwakowi wewnątrz Spotify. Windows/macOS nie są objęte tą poprawką.
+
+## Ulubiony odtwarzacz startowy
 
 1. Uruchom aplikację multimedialną i wybierz ją na liście **Odtwarzacz (wybór ręczny)**.
 2. Kliknij przycisk z **gwiazdką**. Stan **Ulubiony** oraz opis **Start: …** oznaczają wybrany cel startowy.
